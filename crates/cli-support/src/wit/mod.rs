@@ -279,30 +279,39 @@ impl<'a> Context<'a> {
         {
             let WasmBindgenDescriptorsSection {
                 descriptors,
-                cast_imports,
                 generic_imports,
             } = *custom;
             // Store all the executed descriptors in our own field so we have
             // access to them while processing programs.
             self.descriptors.extend(descriptors);
 
-            // Generic imports need JS-binding metadata recovered from the AST
-            // import pass, which hasn't run yet. Stash them for manufacture
-            // after all programs are processed.
-            self.pending_generic_imports = generic_imports;
-
-            // Sort cast imports by signature for deterministic output.
-            let mut sorted_casts: Vec<_> = cast_imports
-                .into_iter()
-                .map(|(descriptor, orig_func_ids)| {
+            // Per-monomorphisation imports discovered via the shared
+            // `__wbindgen_describe_generic_import` marker come in two flavours,
+            // distinguished by the shim key:
+            //
+            // * An empty key marks a `wbg_cast` identity adapter. It needs no
+            //   AST metadata, so we manufacture it right here (as we always
+            //   have) to keep emission order stable.
+            // * A non-empty key is a generic (per-monomorphisation) import. Its
+            //   JS binding metadata is only recovered during the AST import
+            //   pass, which hasn't run yet, so stash it for manufacture in
+            //   `bind_generic_imports`.
+            let mut sorted_casts: Vec<_> = Vec::new();
+            for ((shim, descriptor), orig_func_ids) in generic_imports {
+                if shim.is_empty() {
                     let signature = descriptor.unwrap_function();
                     let [arg] = &signature.arguments[..] else {
                         unreachable!("Cast function must take exactly one argument");
                     };
                     let sig_comment = format!("{arg:?} -> {:?}", &signature.ret);
-                    (sig_comment, signature, orig_func_ids)
-                })
-                .collect();
+                    sorted_casts.push((sig_comment, signature, orig_func_ids));
+                } else {
+                    self.pending_generic_imports
+                        .insert((shim, descriptor), orig_func_ids);
+                }
+            }
+
+            // Sort cast imports by signature for deterministic output.
             sorted_casts.sort_by(|a, b| a.0.cmp(&b.0));
 
             for (idx, (sig_comment, signature, orig_func_ids)) in
@@ -340,9 +349,12 @@ impl<'a> Context<'a> {
     /// generic-import monomorphisation, and rewrite every originating call site
     /// to the manufactured import.
     ///
-    /// This mirrors the cast manufacture path in `init`, except the JS binding
-    /// carries the real import semantics (kind/name/catch/variadic) recovered
-    /// from the AST entry via `shim`, rather than being an identity adapter.
+    /// This mirrors the cast manufacture path in `init` (both are discovered by
+    /// the same `__wbindgen_describe_generic_import` marker), except the JS
+    /// binding here carries the real import semantics (kind/name/catch/variadic)
+    /// recovered from the AST entry via `shim`, rather than being an identity
+    /// adapter. Casts (empty shim key) are handled in `init`; only non-empty
+    /// keys reach `pending_generic_imports`.
     fn bind_generic_imports(&mut self) -> Result<(), Error> {
         let pending = std::mem::take(&mut self.pending_generic_imports);
         if pending.is_empty() {
@@ -1676,7 +1688,6 @@ impl<'a> Context<'a> {
             // need to error about them in this verification pass though,
             // having them lingering in the module is normal.
             if import.name == "__wbindgen_describe"
-                || import.name == "__wbindgen_describe_cast"
                 || import.name == "__wbindgen_describe_generic_import"
             {
                 continue;

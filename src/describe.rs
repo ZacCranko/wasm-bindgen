@@ -20,11 +20,12 @@ pub fn inform(a: u32) {
     unsafe { super::__wbindgen_describe(a) }
 }
 
-/// Marker terminating a per-monomorphisation generic-import descriptor
-/// function. See `__wbindgen_describe_generic_import` in the crate root. `func`
-/// is the monomorphised shim's own pointer and `prims` points at its ABI
-/// arguments; both exist only to keep inputs live across the opaque FFI
-/// boundary so the descriptor survives to be interpreted by the CLI.
+/// Marker terminating a per-monomorphisation descriptor function. See
+/// `__wbindgen_describe_generic_import` in the crate root. Used both for
+/// generic imports and, with an empty shim key, for `__rt::wbg_cast` identity
+/// adapters. `func` is the monomorphised shim's own pointer and `prims` points
+/// at its ABI arguments; both exist only to keep inputs live across the opaque
+/// FFI boundary so the descriptor survives to be interpreted by the CLI.
 ///
 /// Must be `#[inline(always)]` (like [`inform`]) so the marker call lands
 /// directly inside each monomorphised shim; the CLI's discovery pass scans for
