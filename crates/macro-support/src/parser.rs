@@ -127,6 +127,11 @@ macro_rules! attrgen {
             (unchecked_optional_param_type, true, OptionalParamType(Span, String, Span)),
             (param_description, true, ParamDesc(Span, String, Span)),
 
+            // Opt-in to the experimental per-monomorphisation generic import
+            // codegen path (interpreter-discovered, marker-terminated) instead
+            // of the type-erasure path.
+            (generic_per_mono, false, GenericPerMono(Span)),
+
             // For testing purposes only.
             (assert_no_shim, false, AssertNoShim(Span)),
         }
@@ -1090,6 +1095,7 @@ impl<'a>
             }
         }
         let assert_no_shim = opts.assert_no_shim().is_some();
+        let generic_per_mono = opts.generic_per_mono().is_some();
 
         let mut doc_comment = String::new();
         // Extract the doc comments from our list of attributes.
@@ -1147,6 +1153,7 @@ impl<'a>
             wasm_bindgen_futures: program.wasm_bindgen_futures.clone(),
             js_sys: program.js_sys.clone(),
             generics: self.sig.generics,
+            generic_per_mono,
         });
         opts.check_used();
 

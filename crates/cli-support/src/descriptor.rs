@@ -93,6 +93,18 @@ impl Descriptor {
         descriptor
     }
 
+    /// Decode a per-monomorphisation generic-import descriptor stream.
+    ///
+    /// The stream is a length-prefixed `shim` key string (identifying which
+    /// generic-import AST entry supplies the JS binding metadata) followed by
+    /// the concrete `FUNCTION` signature for this monomorphisation.
+    pub fn decode_generic_import(mut data: &[u32]) -> (String, Descriptor) {
+        let key = get_string(&mut data);
+        let descriptor = Descriptor::_decode(&mut data, false);
+        assert!(data.is_empty(), "remaining data {data:?}");
+        (key, descriptor)
+    }
+
     fn _decode(data: &mut &[u32], clamped: bool) -> Descriptor {
         match get(data) {
             I8 => Descriptor::I8,

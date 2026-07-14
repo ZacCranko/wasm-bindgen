@@ -72,6 +72,11 @@ macro_rules! shared_api {
             method: Option<MethodData<'a>>,
             structural: bool,
             function: Function<'a>,
+            // Whether this import is generic (has type parameters) and is
+            // therefore bound per-monomorphisation via the
+            // `__wbindgen_describe_generic_import` marker rather than a single
+            // named descriptor shim.
+            generic: bool,
         }
 
         struct MethodData<'a> {

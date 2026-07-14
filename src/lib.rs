@@ -1321,6 +1321,15 @@ externs! {
 
         fn __wbindgen_describe(v: u32) -> ();
         fn __wbindgen_describe_cast(func: *const (), prims: *const ()) -> *const ();
+        // Marker for per-monomorphisation generic imports. Like
+        // `__wbindgen_describe_cast` it terminates a descriptor function and
+        // signals to the CLI that the parent function is a generic-import
+        // monomorphisation to be discovered, interpreted, and rewritten to a
+        // manufactured JS binding. The descriptor stream preceding this call
+        // carries a length-prefixed `shim` key (identifying which generic
+        // import AST entry supplies the JS binding metadata) followed by the
+        // concrete `FUNCTION` signature for this monomorphisation.
+        fn __wbindgen_describe_generic_import(func: *const (), prims: *const ()) -> *const ();
     }
 }
 

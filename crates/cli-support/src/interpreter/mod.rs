@@ -36,6 +36,7 @@ pub struct Interpreter {
     // to know when the environment's imported function is called.
     describe_id: Option<FunctionId>,
     describe_cast_id: Option<FunctionId>,
+    describe_generic_import_id: Option<FunctionId>,
 
     // Linear memory mirroring the module's own, used for stack loads/stores
     // during descriptor execution.
@@ -185,6 +186,8 @@ impl Interpreter {
                 ret.describe_id = Some(id);
             } else if import.name == "__wbindgen_describe_cast" {
                 ret.describe_cast_id = Some(id);
+            } else if import.name == "__wbindgen_describe_generic_import" {
+                ret.describe_generic_import_id = Some(id);
             }
         }
 
@@ -283,6 +286,12 @@ impl Interpreter {
     /// imported function.
     pub fn describe_cast_id(&self) -> Option<FunctionId> {
         self.describe_cast_id
+    }
+
+    /// Returns the function id of the `__wbindgen_describe_generic_import`
+    /// imported function.
+    pub fn describe_generic_import_id(&self) -> Option<FunctionId> {
+        self.describe_generic_import_id
     }
 
     /// Returns the export id of the `__wbindgen_skip_interpret_calls`.
@@ -524,10 +533,14 @@ impl Frame<'_> {
                     // If this function is calling the `__wbindgen_describe_cast`
                     // function then it's just a marker for the parent function
                     // to be treated as a cast.
-                    } else if Some(func) == self.interp.describe_cast_id {
-                        log::trace!("__wbindgen_describe_cast()");
-                        // `__wbindgen_describe_cast` marks the end of the cast
-                        // descriptor. Stop here, ignoring anything on the stack.
+                    } else if Some(func) == self.interp.describe_cast_id
+                        || Some(func) == self.interp.describe_generic_import_id
+                    {
+                        log::trace!("__wbindgen_describe_cast/generic_import()");
+                        // Both `__wbindgen_describe_cast` and
+                        // `__wbindgen_describe_generic_import` are sentinel
+                        // markers that terminate a marker-discovered descriptor
+                        // function. Stop here, ignoring anything on the stack.
                         // Restore SP to its entry value since the normal function
                         // epilogue won't run.
                         if let Some(sp) = self.interp.stack_pointer {

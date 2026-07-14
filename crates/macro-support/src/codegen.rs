@@ -2039,6 +2039,9 @@ impl ToTokens for ast::DynamicUnion {
 
 impl TryToTokens for ast::ImportFunction {
     fn try_to_tokens(&self, tokens: &mut TokenStream) -> Result<(), Diagnostic> {
+        if self.generic_per_mono {
+            return self.try_to_tokens_generic(tokens);
+        }
         let mut class = None;
         let mut is_constructor = false;
         let mut is_method = false;
@@ -2500,6 +2503,163 @@ impl TryToTokens for ast::ImportFunction {
     }
 }
 
+impl ast::ImportFunction {
+    /// Experimental per-monomorphisation codegen for a generic import.
+    ///
+    /// Instead of erasing type parameters to `JsValue`, this emits a
+    /// monomorphised `#[inline(never)]` shim (modelled on `wbg_cast`'s
+    /// `breaks_if_inlined`) that, per concrete instantiation, describes its
+    /// exact ABI signature and terminates with the
+    /// `__wbindgen_describe_generic_import` marker. The CLI interpreter
+    /// discovers each monomorphisation, recovers its `(shim key, signature)`,
+    /// and rewrites the call site to a manufactured JS binding.
+    ///
+    /// MVP scope: free function, owned arguments, unit return, no lifetimes,
+    /// `catch`, `variadic`, or `async`.
+    fn try_to_tokens_generic(&self, tokens: &mut TokenStream) -> Result<(), Diagnostic> {
+        let wasm_bindgen = &self.wasm_bindgen;
+
+        // --- MVP scope guards (opt-in path, so bailing is safe) ---
+        if !matches!(self.kind, ast::ImportFunctionKind::Normal) {
+            bail_span!(
+                self.rust_name,
+                "generic_per_mono imports currently only support free functions"
+            );
+        }
+        if self.function.r#async {
+            bail_span!(self.rust_name, "generic_per_mono imports cannot be async yet");
+        }
+        if self.catch {
+            bail_span!(self.rust_name, "generic_per_mono imports cannot use catch yet");
+        }
+        if self.variadic {
+            bail_span!(self.rust_name, "generic_per_mono imports cannot be variadic yet");
+        }
+        if self.function.ret.is_some() {
+            bail_span!(
+                self.rust_name,
+                "generic_per_mono imports currently only support a unit return"
+            );
+        }
+        if self.generics.lifetimes().next().is_some() {
+            bail_span!(
+                self.rust_name,
+                "generic_per_mono imports cannot have lifetime parameters yet"
+            );
+        }
+        let type_params: Vec<&syn::Ident> =
+            self.generics.type_params().map(|tp| &tp.ident).collect();
+        if type_params.is_empty() {
+            bail_span!(
+                self.rust_name,
+                "generic_per_mono requires at least one type parameter"
+            );
+        }
+
+        // --- Per-argument wrapper signature, ABI splat, and describe ---
+        let mut wrapper_args = Vec::new();
+        let mut shim_abi_args = Vec::new();
+        let mut all_prim_names = Vec::new();
+        let mut arg_conversions = Vec::new();
+        let mut describe_args = Vec::new();
+        for (i, arg) in self.function.arguments.iter().enumerate() {
+            let ty = &*arg.pat_type.ty;
+            let name = match &*arg.pat_type.pat {
+                syn::Pat::Ident(syn::PatIdent {
+                    by_ref: None,
+                    ident,
+                    subpat: None,
+                    ..
+                }) => ident.clone(),
+                syn::Pat::Wild(_) => Ident::new(&format!("__genarg_{i}"), Span::call_site()),
+                _ => bail_span!(
+                    arg.pat_type.pat,
+                    "unsupported pattern in generic_per_mono imported function",
+                ),
+            };
+            wrapper_args.push(quote! { #name: #ty });
+
+            let abi = quote! { <#ty as #wasm_bindgen::convert::IntoWasmAbi>::Abi };
+            let (args, names) = splat(wasm_bindgen, &name, &abi);
+            shim_abi_args.extend(args);
+            arg_conversions.push(quote! {
+                let (#(#names),*) = #wasm_bindgen::convert::WasmAbi::split(
+                    #wasm_bindgen::convert::IntoWasmAbi::into_abi(#name)
+                );
+            });
+            all_prim_names.extend(names);
+            describe_args.push(quote! {
+                <#ty as WasmDescribe>::describe();
+            });
+        }
+
+        // --- Descriptor stream: [key string][FUNCTION signature] ---
+        let key = self.shim.to_string();
+        let key_len = key.len() as u32;
+        let key_chars = key.chars().map(|c| c as u32);
+        let nargs = self.function.arguments.len() as u32;
+
+        // --- Assemble ---
+        let vis = &self.function.rust_vis;
+        let rust_name = &self.rust_name;
+        let attrs = &self.function.rust_attrs;
+        let doc = if self.doc_comment.is_empty() {
+            quote! {}
+        } else {
+            let doc_comment = &self.doc_comment;
+            quote! { #[doc = #doc_comment] }
+        };
+        let generic_params = &self.generics.params;
+        let turbofish = quote! { ::<#(#type_params),*> };
+
+        let invocation = quote! {
+            #[allow(nonstandard_style)]
+            #[allow(clippy::all, clippy::nursery, clippy::pedantic, clippy::restriction)]
+            #(#attrs)*
+            #doc
+            #vis fn #rust_name <#generic_params> (#(#wrapper_args),*)
+            where
+                #(#type_params: #wasm_bindgen::convert::IntoWasmAbi
+                    + #wasm_bindgen::describe::WasmDescribe,)*
+            {
+                #[inline(never)]
+                #[cfg_attr(wasm_bindgen_unstable_test_coverage, coverage(off))]
+                unsafe extern "C" fn breaks_if_inlined<#(#type_params),*>(
+                    #(#shim_abi_args),*
+                )
+                where
+                    #(#type_params: #wasm_bindgen::convert::IntoWasmAbi
+                        + #wasm_bindgen::describe::WasmDescribe,)*
+                {
+                    use #wasm_bindgen::describe::*;
+                    // Leading length-prefixed `shim` key identifying the AST
+                    // entry that supplies this import's JS binding metadata.
+                    inform(#key_len);
+                    #(inform(#key_chars);)*
+                    // Concrete FUNCTION signature for this monomorphisation.
+                    inform(FUNCTION);
+                    inform(0);
+                    inform(#nargs);
+                    #(#describe_args)*
+                    <() as WasmDescribe>::describe();
+                    <() as WasmDescribe>::describe();
+                    let _ = #wasm_bindgen::describe::describe_generic_import(
+                        breaks_if_inlined #turbofish as _,
+                        &(#(#all_prim_names,)*) as *const _ as _,
+                    );
+                }
+
+                unsafe {
+                    #(#arg_conversions)*
+                    breaks_if_inlined #turbofish (#(#all_prim_names),*);
+                }
+            }
+        };
+        invocation.to_tokens(tokens);
+        Ok(())
+    }
+}
+
 // See comment above in ast::Export for what's going on here.
 struct DescribeImport<'a> {
     kind: &'a ast::ImportKind,
@@ -2845,6 +3005,13 @@ impl TryToTokens for DescribeImport<'_> {
             ast::ImportKind::Enum(_) => return Ok(()),
             ast::ImportKind::DynamicUnion(_) => return Ok(()),
         };
+        // Per-monomorphisation generic imports emit their own descriptor
+        // (key + signature) inside the monomorphised shim, terminated by the
+        // `__wbindgen_describe_generic_import` marker, so no named descriptor
+        // export is generated here.
+        if f.generic_per_mono {
+            return Ok(());
+        }
         let fn_class_generics = f.get_fn_generics()?;
         let fn_lifetime_params = generics::lifetime_params(&f.generics);
         let argtys = f

@@ -40,6 +40,25 @@ struct Context<'a> {
     /// when wasm-ld ICF merges invoke functions for different closure types
     /// into the same export.
     export_adapter_sigs: HashMap<AdapterId, (Vec<Descriptor>, Descriptor, Option<Descriptor>)>,
+    /// Owned JS-binding metadata for generic (per-monomorphisation) imports,
+    /// recorded during the AST import pass and keyed by `shim`. The generic
+    /// import discovery pass (`bind_generic_imports`) joins the interpreted
+    /// per-monomorphisation signatures against this table by `shim` to
+    /// manufacture one JS binding per `(shim, signature)`.
+    generic_import_bindings: HashMap<String, GenericImportMeta>,
+    /// Per-monomorphisation generic imports discovered by the interpreter in
+    /// `init`, stashed until after all programs are processed (the AST import
+    /// pass populates `generic_import_bindings`, which the manufacture step
+    /// then joins against by `shim`).
+    pending_generic_imports: HashMap<(String, Descriptor), Vec<FunctionId>>,
+}
+
+/// Owned JS-binding metadata for a generic import, captured from its decoded
+/// AST entry so it can be applied to each discovered monomorphisation.
+struct GenericImportMeta {
+    js_import: JsImport,
+    catch: bool,
+    variadic: bool,
 }
 
 struct InstructionBuilder<'a, 'b> {
@@ -83,12 +102,18 @@ pub fn process(
         support_start: bindgen.emit_start,
         linked_modules: bindgen.split_linked_modules,
         export_adapter_sigs: Default::default(),
+        generic_import_bindings: Default::default(),
+        pending_generic_imports: Default::default(),
     };
     cx.init()?;
 
     for program in programs {
         cx.program(program)?;
     }
+
+    // All AST import metadata is now recorded; manufacture the per-
+    // monomorphisation generic-import bindings discovered by the interpreter.
+    cx.bind_generic_imports()?;
 
     if !cx.start_found {
         cx.discover_main()?;
@@ -247,10 +272,16 @@ impl<'a> Context<'a> {
             let WasmBindgenDescriptorsSection {
                 descriptors,
                 cast_imports,
+                generic_imports,
             } = *custom;
             // Store all the executed descriptors in our own field so we have
             // access to them while processing programs.
             self.descriptors.extend(descriptors);
+
+            // Generic imports need JS-binding metadata recovered from the AST
+            // import pass, which hasn't run yet. Stash them for manufacture
+            // after all programs are processed.
+            self.pending_generic_imports = generic_imports;
 
             // Sort cast imports by signature for deterministic output.
             let mut sorted_casts: Vec<_> = cast_imports
@@ -294,6 +325,79 @@ impl<'a> Context<'a> {
 
         self.aux.thread_destroy = self.thread_destroy();
 
+        Ok(())
+    }
+
+    /// Manufacture one JS binding per discovered `(shim, signature)`
+    /// generic-import monomorphisation, and rewrite every originating call site
+    /// to the manufactured import.
+    ///
+    /// This mirrors the cast manufacture path in `init`, except the JS binding
+    /// carries the real import semantics (name/catch/variadic) recovered from
+    /// the AST entry via `shim`, rather than being an identity adapter.
+    fn bind_generic_imports(&mut self) -> Result<(), Error> {
+        let pending = std::mem::take(&mut self.pending_generic_imports);
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        // Deterministic ordering for stable import names/output.
+        let mut sorted: Vec<_> = pending
+            .into_iter()
+            .map(|((shim, descriptor), orig_func_ids)| {
+                let signature = descriptor.unwrap_function();
+                let sig_comment = format!(
+                    "{shim}: {:?} -> {:?}",
+                    &signature.arguments, &signature.ret
+                );
+                (sig_comment, shim, signature, orig_func_ids)
+            })
+            .collect();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut duplicate_import_map = HashMap::new();
+        for (idx, (sig_comment, shim, signature, orig_func_ids)) in
+            sorted.into_iter().enumerate()
+        {
+            let meta = self.generic_import_bindings.get(&shim).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "generic import monomorphisation references unknown shim `{shim}`; \
+                     no matching #[wasm_bindgen] generic import AST entry was found"
+                )
+            })?;
+            let js_import = meta.js_import.clone();
+            let catch = meta.catch;
+            let variadic = meta.variadic;
+
+            let import_name = format!("__wbindgen_generic_{:016x}", idx + 1);
+            let ty = self.module.funcs.get(orig_func_ids[0]).ty();
+            let (import_func_id, import_id) =
+                self.module
+                    .add_import_func(PLACEHOLDER_MODULE, &import_name, ty);
+            self.module.funcs.get_mut(import_func_id).name = Some(sig_comment);
+
+            let id = self.import_adapter(import_id, signature, AdapterJsImportKind::Normal)?;
+
+            let adapter = self.adapters.implements.last().unwrap().2;
+            if catch {
+                self.aux.imports_with_catch.insert(adapter);
+                if self.aux.exn_store.is_none() {
+                    self.find_exn_store();
+                }
+            }
+            if variadic {
+                self.aux.imports_with_variadic.insert(id);
+            }
+
+            self.aux
+                .import_map
+                .insert(id, AuxImport::Value(AuxValue::Bare(js_import)));
+
+            duplicate_import_map
+                .extend(orig_func_ids.into_iter().map(|f| (f, import_func_id)));
+        }
+
+        self.handle_duplicate_imports(&duplicate_import_map);
         Ok(())
     }
 
@@ -766,8 +870,35 @@ impl<'a> Context<'a> {
             structural,
             function,
             assert_no_shim,
+            generic,
         } = function;
         let generate_typescript = import.generate_typescript;
+
+        // Generic (per-monomorphisation) imports have no single descriptor
+        // shim; each concrete instantiation is discovered by the interpreter
+        // via the `__wbindgen_describe_generic_import` marker. Here we only
+        // record the JS-binding metadata keyed by `shim`, to be applied to each
+        // discovered monomorphisation in `bind_generic_imports`.
+        if generic {
+            if method.is_some() {
+                bail!(
+                    "generic #[wasm_bindgen] imports are currently only supported \
+                     for free functions (shim `{shim}`)"
+                );
+            }
+            let js_import =
+                self.determine_import(&import.module, &import.js_namespace, function.name)?;
+            self.generic_import_bindings.insert(
+                shim.to_string(),
+                GenericImportMeta {
+                    js_import,
+                    catch,
+                    variadic,
+                },
+            );
+            return Ok(());
+        }
+
         let (import_id, _id) = match self.function_imports.get(shim) {
             Some(pair) => *pair,
             None => {
@@ -1501,7 +1632,10 @@ impl<'a> Context<'a> {
             // phase, but we don't have an implementation for them. We don't
             // need to error about them in this verification pass though,
             // having them lingering in the module is normal.
-            if import.name == "__wbindgen_describe" || import.name == "__wbindgen_describe_cast" {
+            if import.name == "__wbindgen_describe"
+                || import.name == "__wbindgen_describe_cast"
+                || import.name == "__wbindgen_describe_generic_import"
+            {
                 continue;
             }
             if implemented.remove(&import.id()).is_none() {
@@ -2170,6 +2304,8 @@ mod tests {
             support_start: true,
             linked_modules: false,
             export_adapter_sigs: Default::default(),
+            generic_import_bindings: Default::default(),
+            pending_generic_imports: Default::default(),
         };
         cx.discover_main().unwrap();
         cx.start_found

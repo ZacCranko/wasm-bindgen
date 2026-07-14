@@ -21,6 +21,13 @@ use walrus::{CustomSection, FunctionId, Module, TypedCustomSectionId};
 pub struct WasmBindgenDescriptorsSection {
     pub descriptors: HashMap<String, Descriptor>,
     pub cast_imports: HashMap<Descriptor, Vec<FunctionId>>,
+    /// Per-monomorphisation generic imports, discovered via the
+    /// `__wbindgen_describe_generic_import` marker. Keyed by the `(shim, signature)`
+    /// pair so that two distinct generic imports sharing an identical concrete
+    /// signature don't collapse into a single manufactured binding. The `shim`
+    /// identifies which generic-import AST entry supplies the JS binding
+    /// metadata (name, kind, namespace, catch, ...).
+    pub generic_imports: HashMap<(String, Descriptor), Vec<FunctionId>>,
 }
 
 pub type WasmBindgenDescriptorsSectionId = TypedCustomSectionId<WasmBindgenDescriptorsSection>;
@@ -35,6 +42,7 @@ pub fn execute(module: &mut Module) -> Result<WasmBindgenDescriptorsSectionId, E
 
     section.execute_exports(module, &mut interpreter)?;
     section.execute_casts(module, &mut interpreter)?;
+    section.execute_generic_imports(module, &mut interpreter)?;
 
     Ok(module.customs.add(section))
 }
@@ -122,6 +130,64 @@ impl WasmBindgenDescriptorsSection {
         impl Visitor<'_> for FindDescribeCast {
             fn visit_call(&mut self, call: &Call) {
                 if call.func == self.wbindgen_describe_cast {
+                    self.found = true;
+                }
+            }
+        }
+    }
+
+    /// Discover per-monomorphisation generic imports.
+    ///
+    /// This mirrors [`Self::execute_casts`]: it finds every function that calls
+    /// the `__wbindgen_describe_generic_import` marker, interprets each to
+    /// recover its `(shim, concrete signature)`, and groups the originating
+    /// function ids by that key. A generic import is effectively the same
+    /// discovery mechanism as a cast, except the interpreted descriptor stream
+    /// carries a leading `shim` key so the CLI can later attach the real JS
+    /// binding metadata (name/kind/namespace/catch) rather than an identity
+    /// adapter.
+    fn execute_generic_imports(
+        &mut self,
+        module: &mut Module,
+        interpreter: &mut Interpreter,
+    ) -> Result<(), Error> {
+        use walrus::ir::*;
+
+        let wbindgen_describe_generic_import = match interpreter.describe_generic_import_id() {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+
+        let mut generic_funcs = Vec::new();
+        for (func_id, local) in module.funcs.iter_local() {
+            let mut find = FindDescribeGenericImport {
+                wbindgen_describe_generic_import,
+                found: false,
+            };
+            dfs_in_order(&mut find, local, local.entry_block());
+            if find.found {
+                generic_funcs.push(func_id);
+            }
+        }
+        for func_id in generic_funcs {
+            let descriptor = interpreter.interpret_descriptor(func_id, module);
+            let (shim, descriptor) = Descriptor::decode_generic_import(descriptor);
+            self.generic_imports
+                .entry((shim, descriptor))
+                .or_default()
+                .push(func_id);
+        }
+
+        return Ok(());
+
+        struct FindDescribeGenericImport {
+            wbindgen_describe_generic_import: FunctionId,
+            found: bool,
+        }
+
+        impl Visitor<'_> for FindDescribeGenericImport {
+            fn visit_call(&mut self, call: &Call) {
+                if call.func == self.wbindgen_describe_generic_import {
                     self.found = true;
                 }
             }
