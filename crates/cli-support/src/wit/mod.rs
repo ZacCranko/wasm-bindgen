@@ -285,57 +285,13 @@ impl<'a> Context<'a> {
             // access to them while processing programs.
             self.descriptors.extend(descriptors);
 
-            // Per-monomorphisation imports discovered via the shared
-            // `__wbindgen_describe_generic_import` marker come in two flavours,
-            // distinguished by the shim key:
-            //
-            // * An empty key marks a `wbg_cast` identity adapter. It needs no
-            //   AST metadata, so we manufacture it right here (as we always
-            //   have) to keep emission order stable.
-            // * A non-empty key is a generic (per-monomorphisation) import. Its
-            //   JS binding metadata is only recovered during the AST import
-            //   pass, which hasn't run yet, so stash it for manufacture in
-            //   `bind_generic_imports`.
-            let mut sorted_casts: Vec<_> = Vec::new();
-            for ((shim, descriptor), orig_func_ids) in generic_imports {
-                if shim.is_empty() {
-                    let signature = descriptor.unwrap_function();
-                    let [arg] = &signature.arguments[..] else {
-                        unreachable!("Cast function must take exactly one argument");
-                    };
-                    let sig_comment = format!("{arg:?} -> {:?}", &signature.ret);
-                    sorted_casts.push((sig_comment, signature, orig_func_ids));
-                } else {
-                    self.pending_generic_imports
-                        .insert((shim, descriptor), orig_func_ids);
-                }
-            }
-
-            // Sort cast imports by signature for deterministic output.
-            sorted_casts.sort_by(|a, b| a.0.cmp(&b.0));
-
-            for (idx, (sig_comment, signature, orig_func_ids)) in
-                sorted_casts.into_iter().enumerate()
-            {
-                // Use the sort index for a deterministic import name.
-                let import_name = format!("__wbindgen_cast_{:016x}", idx + 1);
-
-                // Manufacture an import for this cast.
-                let ty = self.module.funcs.get(orig_func_ids[0]).ty();
-                let (import_func_id, import_id) =
-                    self.module
-                        .add_import_func(PLACEHOLDER_MODULE, &import_name, ty);
-                self.module.funcs.get_mut(import_func_id).name = Some(sig_comment.clone());
-                let adapter_id =
-                    self.import_adapter(import_id, signature, AdapterJsImportKind::Normal)?;
-                self.aux
-                    .import_map
-                    .insert(adapter_id, AuxImport::Cast { sig_comment });
-
-                // Mark all original functions for replacement with the new import.
-                duplicate_import_map
-                    .extend(orig_func_ids.into_iter().map(|id| (id, import_func_id)));
-            }
+            // Per-monomorphisation imports discovered via the
+            // `__wbindgen_describe_generic_import` marker — both generic imports
+            // and `wbg_cast` identity adapters (empty shim key) — are
+            // manufactured together in `bind_generic_imports`, after the AST
+            // import pass has recorded the JS-binding metadata that generic
+            // imports need. Stash them until then.
+            self.pending_generic_imports = generic_imports;
         }
 
         self.handle_duplicate_imports(&duplicate_import_map);
@@ -346,30 +302,41 @@ impl<'a> Context<'a> {
     }
 
     /// Manufacture one JS binding per discovered `(shim, signature)`
-    /// generic-import monomorphisation, and rewrite every originating call site
-    /// to the manufactured import.
+    /// monomorphisation, and rewrite every originating call site to the
+    /// manufactured import.
     ///
-    /// This mirrors the cast manufacture path in `init` (both are discovered by
-    /// the same `__wbindgen_describe_generic_import` marker), except the JS
-    /// binding here carries the real import semantics (kind/name/catch/variadic)
-    /// recovered from the AST entry via `shim`, rather than being an identity
-    /// adapter. Casts (empty shim key) are handled in `init`; only non-empty
-    /// keys reach `pending_generic_imports`.
+    /// Both kinds of entry discovered by the shared
+    /// `__wbindgen_describe_generic_import` marker are handled here, sharing one
+    /// sorted list, one index counter and one `__wbindgen_generic_*` naming
+    /// scheme:
+    ///
+    /// * A non-empty `shim` is a generic (per-monomorphisation) import. Its JS
+    ///   binding carries the real import semantics (kind/name/catch/variadic)
+    ///   recovered from the AST entry via `shim`.
+    /// * An empty `shim` is a [`wbg_cast`](wasm_bindgen::__rt::wbg_cast)
+    ///   identity adapter, bound as `AuxImport::Cast` (JS that returns its
+    ///   single argument unchanged); it needs no AST metadata.
     fn bind_generic_imports(&mut self) -> Result<(), Error> {
         let pending = std::mem::take(&mut self.pending_generic_imports);
         if pending.is_empty() {
             return Ok(());
         }
 
-        // Deterministic ordering for stable import names/output.
+        // Deterministic ordering for stable import names/output. Casts (empty
+        // shim key) and generic imports share one sorted list and one index
+        // counter; each entry's signature comment doubles as the sort key.
         let mut sorted: Vec<_> = pending
             .into_iter()
             .map(|((shim, descriptor), orig_func_ids)| {
                 let signature = descriptor.unwrap_function();
-                let sig_comment = format!(
-                    "{shim}: {:?} -> {:?}",
-                    &signature.arguments, &signature.ret
-                );
+                let sig_comment = if shim.is_empty() {
+                    let [arg] = &signature.arguments[..] else {
+                        unreachable!("Cast function must take exactly one argument");
+                    };
+                    format!("{arg:?} -> {:?}", &signature.ret)
+                } else {
+                    format!("{shim}: {:?} -> {:?}", &signature.arguments, &signature.ret)
+                };
                 (sig_comment, shim, signature, orig_func_ids)
             })
             .collect();
@@ -379,42 +346,51 @@ impl<'a> Context<'a> {
         for (idx, (sig_comment, shim, signature, orig_func_ids)) in
             sorted.into_iter().enumerate()
         {
-            let meta = self.generic_import_bindings.get(&shim).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "generic import monomorphisation references unknown shim `{shim}`; \
-                     no matching #[wasm_bindgen] generic import AST entry was found"
-                )
-            })?;
-            let aux_import = meta.aux_import.clone();
-            let adapter_kind = meta.adapter_kind.clone();
-            let catch = meta.catch;
-            let variadic = meta.variadic;
-            let assert_no_shim = meta.assert_no_shim;
-
             let import_name = format!("__wbindgen_generic_{:016x}", idx + 1);
             let ty = self.module.funcs.get(orig_func_ids[0]).ty();
             let (import_func_id, import_id) =
                 self.module
                     .add_import_func(PLACEHOLDER_MODULE, &import_name, ty);
-            self.module.funcs.get_mut(import_func_id).name = Some(sig_comment);
+            self.module.funcs.get_mut(import_func_id).name = Some(sig_comment.clone());
 
-            let id = self.import_adapter(import_id, signature, adapter_kind)?;
+            if shim.is_empty() {
+                // Cast: identity adapter, no AST metadata required.
+                let id =
+                    self.import_adapter(import_id, signature, AdapterJsImportKind::Normal)?;
+                self.aux
+                    .import_map
+                    .insert(id, AuxImport::Cast { sig_comment });
+            } else {
+                let meta = self.generic_import_bindings.get(&shim).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "generic import monomorphisation references unknown shim `{shim}`; \
+                         no matching #[wasm_bindgen] generic import AST entry was found"
+                    )
+                })?;
+                let aux_import = meta.aux_import.clone();
+                let adapter_kind = meta.adapter_kind.clone();
+                let catch = meta.catch;
+                let variadic = meta.variadic;
+                let assert_no_shim = meta.assert_no_shim;
 
-            let adapter = self.adapters.implements.last().unwrap().2;
-            if catch {
-                self.aux.imports_with_catch.insert(adapter);
-                if self.aux.exn_store.is_none() {
-                    self.find_exn_store();
+                let id = self.import_adapter(import_id, signature, adapter_kind)?;
+
+                let adapter = self.adapters.implements.last().unwrap().2;
+                if catch {
+                    self.aux.imports_with_catch.insert(adapter);
+                    if self.aux.exn_store.is_none() {
+                        self.find_exn_store();
+                    }
                 }
-            }
-            if assert_no_shim {
-                self.aux.imports_with_assert_no_shim.insert(adapter);
-            }
-            if variadic {
-                self.aux.imports_with_variadic.insert(id);
-            }
+                if assert_no_shim {
+                    self.aux.imports_with_assert_no_shim.insert(adapter);
+                }
+                if variadic {
+                    self.aux.imports_with_variadic.insert(id);
+                }
 
-            self.aux.import_map.insert(id, aux_import);
+                self.aux.import_map.insert(id, aux_import);
+            }
 
             duplicate_import_map
                 .extend(orig_func_ids.into_iter().map(|f| (f, import_func_id)));
