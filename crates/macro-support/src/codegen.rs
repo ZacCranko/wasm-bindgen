@@ -2559,10 +2559,7 @@ impl ast::ImportFunction {
         // --- Determine the receiver/class shape (mirrors the normal path) ---
         let mut class = None;
         let mut is_method = false;
-        if let ast::ImportFunctionKind::Method {
-            ty, kind, ..
-        } = &self.kind
-        {
+        if let ast::ImportFunctionKind::Method { ty, kind, .. } = &self.kind {
             class = Some(get_ty(ty).clone());
             if let ast::MethodKind::Operation(ast::Operation {
                 is_static: false, ..

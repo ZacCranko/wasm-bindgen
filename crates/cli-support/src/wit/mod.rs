@@ -343,9 +343,7 @@ impl<'a> Context<'a> {
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut duplicate_import_map = HashMap::new();
-        for (idx, (sig_comment, shim, signature, orig_func_ids)) in
-            sorted.into_iter().enumerate()
-        {
+        for (idx, (sig_comment, shim, signature, orig_func_ids)) in sorted.into_iter().enumerate() {
             let import_name = format!("__wbindgen_generic_{:016x}", idx + 1);
             let ty = self.module.funcs.get(orig_func_ids[0]).ty();
             let (import_func_id, import_id) =
@@ -355,8 +353,7 @@ impl<'a> Context<'a> {
 
             if shim.is_empty() {
                 // Cast: identity adapter, no AST metadata required.
-                let id =
-                    self.import_adapter(import_id, signature, AdapterJsImportKind::Normal)?;
+                let id = self.import_adapter(import_id, signature, AdapterJsImportKind::Normal)?;
                 self.aux
                     .import_map
                     .insert(id, AuxImport::Cast { sig_comment });
@@ -368,7 +365,7 @@ impl<'a> Context<'a> {
                     )
                 })?;
                 let aux_import = meta.aux_import.clone();
-                let adapter_kind = meta.adapter_kind.clone();
+                let adapter_kind = meta.adapter_kind;
                 let catch = meta.catch;
                 let variadic = meta.variadic;
                 let assert_no_shim = meta.assert_no_shim;
@@ -392,8 +389,7 @@ impl<'a> Context<'a> {
                 self.aux.import_map.insert(id, aux_import);
             }
 
-            duplicate_import_map
-                .extend(orig_func_ids.into_iter().map(|f| (f, import_func_id)));
+            duplicate_import_map.extend(orig_func_ids.into_iter().map(|f| (f, import_func_id)));
         }
 
         self.handle_duplicate_imports(&duplicate_import_map);
@@ -906,11 +902,8 @@ impl<'a> Context<'a> {
                     }
                 }
                 None => {
-                    let js_import = self.determine_import(
-                        &import.module,
-                        &import.js_namespace,
-                        function.name,
-                    )?;
+                    let js_import =
+                        self.determine_import(&import.module, &import.js_namespace, function.name)?;
                     (
                         AuxImport::Value(AuxValue::Bare(js_import)),
                         AdapterJsImportKind::Normal,
