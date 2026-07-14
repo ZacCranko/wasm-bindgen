@@ -1,0 +1,23 @@
+error: generic_per_mono imports cannot have lifetime parameters yet; use the type-erasure generic path instead
+  --> ui-tests/generic-per-mono-unsupported.rs:11:8
+   |
+11 |     fn with_lifetime<'a, T>(x: T);
+   |        ^^^^^^^^^^^^^
+
+error: generic_per_mono requires at least one type parameter
+  --> ui-tests/generic-per-mono-unsupported.rs:15:8
+   |
+15 |     fn without_type_param(x: u32);
+   |        ^^^^^^^^^^^^^^^^^^
+
+error: generic_per_mono does not support references to a generic type parameter (`&T`); take the argument by value or use the type-erasure generic path
+  --> ui-tests/generic-per-mono-unsupported.rs:19:29
+   |
+19 |     fn ref_to_generic<T>(x: &T);
+   |                             ^^
+
+error: cannot return references in #[wasm_bindgen] imports yet
+  --> ui-tests/generic-per-mono-unsupported.rs:23:31
+   |
+23 |     fn return_ref<T>(x: T) -> &JsValue;
+   |                               ^^^^^^^^
