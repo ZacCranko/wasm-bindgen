@@ -55,10 +55,18 @@ struct Context<'a> {
 
 /// Owned JS-binding metadata for a generic import, captured from its decoded
 /// AST entry so it can be applied to each discovered monomorphisation.
+///
+/// The `AuxImport` and `AdapterJsImportKind` fully describe how the JS value is
+/// bound (free function, method, constructor, static, getter, setter,
+/// structural, ...) and are independent of the concrete ABI descriptor, so they
+/// can be determined once (during the AST import pass) and reused for every
+/// interpreted monomorphisation.
 struct GenericImportMeta {
-    js_import: JsImport,
+    aux_import: AuxImport,
+    adapter_kind: AdapterJsImportKind,
     catch: bool,
     variadic: bool,
+    assert_no_shim: bool,
 }
 
 struct InstructionBuilder<'a, 'b> {
@@ -333,8 +341,8 @@ impl<'a> Context<'a> {
     /// to the manufactured import.
     ///
     /// This mirrors the cast manufacture path in `init`, except the JS binding
-    /// carries the real import semantics (name/catch/variadic) recovered from
-    /// the AST entry via `shim`, rather than being an identity adapter.
+    /// carries the real import semantics (kind/name/catch/variadic) recovered
+    /// from the AST entry via `shim`, rather than being an identity adapter.
     fn bind_generic_imports(&mut self) -> Result<(), Error> {
         let pending = std::mem::take(&mut self.pending_generic_imports);
         if pending.is_empty() {
@@ -365,9 +373,11 @@ impl<'a> Context<'a> {
                      no matching #[wasm_bindgen] generic import AST entry was found"
                 )
             })?;
-            let js_import = meta.js_import.clone();
+            let aux_import = meta.aux_import.clone();
+            let adapter_kind = meta.adapter_kind.clone();
             let catch = meta.catch;
             let variadic = meta.variadic;
+            let assert_no_shim = meta.assert_no_shim;
 
             let import_name = format!("__wbindgen_generic_{:016x}", idx + 1);
             let ty = self.module.funcs.get(orig_func_ids[0]).ty();
@@ -376,7 +386,7 @@ impl<'a> Context<'a> {
                     .add_import_func(PLACEHOLDER_MODULE, &import_name, ty);
             self.module.funcs.get_mut(import_func_id).name = Some(sig_comment);
 
-            let id = self.import_adapter(import_id, signature, AdapterJsImportKind::Normal)?;
+            let id = self.import_adapter(import_id, signature, adapter_kind)?;
 
             let adapter = self.adapters.implements.last().unwrap().2;
             if catch {
@@ -385,13 +395,14 @@ impl<'a> Context<'a> {
                     self.find_exn_store();
                 }
             }
+            if assert_no_shim {
+                self.aux.imports_with_assert_no_shim.insert(adapter);
+            }
             if variadic {
                 self.aux.imports_with_variadic.insert(id);
             }
 
-            self.aux
-                .import_map
-                .insert(id, AuxImport::Value(AuxValue::Bare(js_import)));
+            self.aux.import_map.insert(id, aux_import);
 
             duplicate_import_map
                 .extend(orig_func_ids.into_iter().map(|f| (f, import_func_id)));
@@ -879,21 +890,53 @@ impl<'a> Context<'a> {
         // via the `__wbindgen_describe_generic_import` marker. Here we only
         // record the JS-binding metadata keyed by `shim`, to be applied to each
         // discovered monomorphisation in `bind_generic_imports`.
+        //
+        // The `AuxImport` / `AdapterJsImportKind` are determined the same way as
+        // for a normal import (the logic below is descriptor-independent), so
+        // methods, constructors, statics, getters, setters and structural
+        // accessors all bind identically to their non-generic counterparts.
         if generic {
-            if method.is_some() {
-                bail!(
-                    "generic #[wasm_bindgen] imports are currently only supported \
-                     for free functions (shim `{shim}`)"
-                );
-            }
-            let js_import =
-                self.determine_import(&import.module, &import.js_namespace, function.name)?;
+            let (aux_import, adapter_kind) = match method {
+                Some(data) => {
+                    let class =
+                        self.determine_import(&import.module, &import.js_namespace, data.class)?;
+                    match data.kind {
+                        decode::MethodKind::Constructor => (
+                            AuxImport::Value(AuxValue::Bare(class)),
+                            AdapterJsImportKind::Constructor,
+                        ),
+                        decode::MethodKind::Operation(op) => {
+                            let (aux, is_method) =
+                                self.determine_import_op(class, &function, structural, op)?;
+                            let kind = if is_method {
+                                AdapterJsImportKind::Method
+                            } else {
+                                AdapterJsImportKind::Normal
+                            };
+                            (aux, kind)
+                        }
+                    }
+                }
+                None => {
+                    let js_import = self.determine_import(
+                        &import.module,
+                        &import.js_namespace,
+                        function.name,
+                    )?;
+                    (
+                        AuxImport::Value(AuxValue::Bare(js_import)),
+                        AdapterJsImportKind::Normal,
+                    )
+                }
+            };
             self.generic_import_bindings.insert(
                 shim.to_string(),
                 GenericImportMeta {
-                    js_import,
+                    aux_import,
+                    adapter_kind,
                     catch,
                     variadic,
+                    assert_no_shim,
                 },
             );
             return Ok(());

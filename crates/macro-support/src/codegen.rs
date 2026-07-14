@@ -2514,37 +2514,42 @@ impl ast::ImportFunction {
     /// discovers each monomorphisation, recovers its `(shim key, signature)`,
     /// and rewrites the call site to a manufactured JS binding.
     ///
-    /// MVP scope: free function, owned arguments, unit return, no lifetimes,
-    /// `catch`, `variadic`, or `async`.
+    /// Supported: free functions, methods, constructors, static methods,
+    /// getters/setters (structural and non-structural), owned arguments
+    /// (including generic `T`, `Option<T>`, `Vec<T>`, and concrete
+    /// references/slices/strings), unit and non-unit returns (including a
+    /// generic `-> T`), `catch`, `variadic`, and `async`.
+    ///
+    /// Not (yet) supported, and rejected with a diagnostic: lifetime or const
+    /// generic parameters, class-level generic parameters, and references to a
+    /// generic type parameter (`&T`) — these keep using the type-erasure path.
     fn try_to_tokens_generic(&self, tokens: &mut TokenStream) -> Result<(), Diagnostic> {
         let wasm_bindgen = &self.wasm_bindgen;
+        let wasm_bindgen_futures = &self.wasm_bindgen_futures;
+        let js_sys = &self.js_sys;
+        let futures = if ast::use_js_sys_futures() {
+            quote! { #js_sys::futures }
+        } else {
+            quote! { #wasm_bindgen_futures }
+        };
+        let promise = if ast::use_js_sys_futures() {
+            quote! { #js_sys::Promise }
+        } else {
+            quote! { #wasm_bindgen_futures::js_sys::Promise }
+        };
 
-        // --- MVP scope guards (opt-in path, so bailing is safe) ---
-        if !matches!(self.kind, ast::ImportFunctionKind::Normal) {
-            bail_span!(
-                self.rust_name,
-                "generic_per_mono imports currently only support free functions"
-            );
-        }
-        if self.function.r#async {
-            bail_span!(self.rust_name, "generic_per_mono imports cannot be async yet");
-        }
-        if self.catch {
-            bail_span!(self.rust_name, "generic_per_mono imports cannot use catch yet");
-        }
-        if self.variadic {
-            bail_span!(self.rust_name, "generic_per_mono imports cannot be variadic yet");
-        }
-        if self.function.ret.is_some() {
-            bail_span!(
-                self.rust_name,
-                "generic_per_mono imports currently only support a unit return"
-            );
-        }
+        // --- Generic-parameter guards (opt-in path, so bailing is safe) ---
         if self.generics.lifetimes().next().is_some() {
             bail_span!(
                 self.rust_name,
-                "generic_per_mono imports cannot have lifetime parameters yet"
+                "generic_per_mono imports cannot have lifetime parameters yet; \
+                 use the type-erasure generic path instead"
+            );
+        }
+        if self.generics.const_params().next().is_some() {
+            bail_span!(
+                self.rust_name,
+                "generic_per_mono imports cannot have const generic parameters yet"
             );
         }
         let type_params: Vec<&syn::Ident> =
@@ -2555,8 +2560,47 @@ impl ast::ImportFunction {
                 "generic_per_mono requires at least one type parameter"
             );
         }
+        let type_param_names: Vec<&Ident> = type_params.clone();
 
-        // --- Per-argument wrapper signature, ABI splat, and describe ---
+        // --- Determine the receiver/class shape (mirrors the normal path) ---
+        let mut class = None;
+        let mut is_method = false;
+        if let ast::ImportFunctionKind::Method {
+            ty, kind, ..
+        } = &self.kind
+        {
+            class = Some(get_ty(ty).clone());
+            if let ast::MethodKind::Operation(ast::Operation {
+                is_static: false, ..
+            }) = kind
+            {
+                is_method = true;
+            }
+            // Constructors and self-returning static methods impl on the return
+            // type's class so the manufactured JS binding attaches correctly.
+            if self.class_return_path().is_some() {
+                class = Some(get_ty(self.js_ret.as_ref().unwrap()).clone());
+            }
+        }
+        // Class-level generics require the erasure machinery (`fn_class_generics`).
+        if let Some(c) = &class {
+            if generics::uses_generic_params(c, &type_param_names) {
+                bail_span!(
+                    self.rust_name,
+                    "generic_per_mono does not support class-level generic parameters yet; \
+                     use the type-erasure generic path instead"
+                );
+            }
+        }
+
+        // --- Per-argument wrapper signature, ABI splat, describe, and bounds ---
+        //
+        // Each type param stays concrete via rustc monomorphisation, so args are
+        // marshalled with the plain `IntoWasmAbi`/`WasmDescribe` traits (no
+        // erasure). We add a `where` bound for exactly the arg/return types that
+        // mention a type parameter (bounding concrete types would be a trivial
+        // bound, which is an error on stable).
+        let mut where_bounds: Vec<TokenStream> = Vec::new();
         let mut wrapper_args = Vec::new();
         let mut shim_abi_args = Vec::new();
         let mut all_prim_names = Vec::new();
@@ -2577,20 +2621,145 @@ impl ast::ImportFunction {
                     "unsupported pattern in generic_per_mono imported function",
                 ),
             };
-            wrapper_args.push(quote! { #name: #ty });
+
+            if generics::uses_generic_params(ty, &type_param_names) {
+                // A reference to a generic type parameter (`&T`) would require a
+                // higher-ranked `for<'a> &'a T: IntoWasmAbi` bound plus impls
+                // that don't generally exist; that case is served by erasure.
+                if let syn::Type::Reference(r) = ty {
+                    if generics::uses_generic_params(&r.elem, &type_param_names) {
+                        bail_span!(
+                            arg.pat_type.ty,
+                            "generic_per_mono does not support references to a generic type \
+                             parameter (`&T`); take the argument by value or use the \
+                             type-erasure generic path"
+                        );
+                    }
+                }
+                where_bounds.push(quote! {
+                    #ty: #wasm_bindgen::convert::IntoWasmAbi + #wasm_bindgen::describe::WasmDescribe
+                });
+            }
+
+            // For methods the first argument is the receiver, referred to as
+            // `self` and omitted from the explicit parameter list.
+            let var = if i == 0 && is_method {
+                quote! { self }
+            } else {
+                wrapper_args.push(quote! { #name: #ty });
+                quote! { #name }
+            };
 
             let abi = quote! { <#ty as #wasm_bindgen::convert::IntoWasmAbi>::Abi };
             let (args, names) = splat(wasm_bindgen, &name, &abi);
             shim_abi_args.extend(args);
             arg_conversions.push(quote! {
-                let (#(#names),*) = #wasm_bindgen::convert::WasmAbi::split(
-                    #wasm_bindgen::convert::IntoWasmAbi::into_abi(#name)
-                );
+                let #name = <#ty as #wasm_bindgen::convert::IntoWasmAbi>::into_abi(#var);
+                let (#(#names),*) = <#abi as #wasm_bindgen::convert::WasmAbi>::split(#name);
             });
             all_prim_names.extend(names);
             describe_args.push(quote! {
-                <#ty as WasmDescribe>::describe();
+                <#ty as #wasm_bindgen::describe::WasmDescribe>::describe();
             });
+        }
+
+        // --- Return handling (mirrors the normal import path) ---
+        let ret_ident = Ident::new("_ret", Span::call_site());
+        let shim_ret_ty;
+        let shim_ret_expr;
+        let describe_ret;
+        let mut convert_ret;
+        let marker_call = quote! {
+            #wasm_bindgen::describe::describe_generic_import(
+                breaks_if_inlined::<#(#type_params),*> as _,
+                &(#(#all_prim_names,)*) as *const _ as _,
+            )
+        };
+        match &self.js_ret {
+            Some(syn::Type::Reference(_)) => {
+                bail_span!(
+                    self.js_ret,
+                    "cannot return references in #[wasm_bindgen] imports yet"
+                );
+            }
+            Some(original_ty) => {
+                let maybe_async_wrapped;
+                let ty = if self.function.r#async {
+                    maybe_async_wrapped = parse_quote!(#promise<#original_ty>);
+                    &maybe_async_wrapped
+                } else {
+                    original_ty
+                };
+                if generics::uses_generic_params(ty, &type_param_names) {
+                    where_bounds.push(quote! {
+                        #ty: #wasm_bindgen::convert::FromWasmAbi
+                            + #wasm_bindgen::describe::WasmDescribe
+                    });
+                }
+                shim_ret_ty = quote! {
+                    #wasm_bindgen::convert::WasmRet<<#ty as #wasm_bindgen::convert::FromWasmAbi>::Abi>
+                };
+                shim_ret_expr = quote! { core::ptr::read(#marker_call as _) };
+                // The descriptor describes the user-facing (inner) return type,
+                // matching the normal path's `DescribeImport`.
+                describe_ret = quote! {
+                    <#original_ty as #wasm_bindgen::describe::WasmDescribe>::describe();
+                };
+                convert_ret = quote! {
+                    <#ty as #wasm_bindgen::convert::FromWasmAbi>::from_abi(#ret_ident.join())
+                };
+                if self.function.r#async {
+                    convert_ret = quote! {
+                        #futures::JsFuture::from(
+                            <#promise<#original_ty> as #wasm_bindgen::convert::FromWasmAbi>
+                                ::from_abi(#ret_ident.join())
+                        ).await
+                    };
+                    convert_ret = if self.catch {
+                        quote! { Ok(#convert_ret?) }
+                    } else {
+                        quote! { #convert_ret.expect("uncaught exception") }
+                    };
+                }
+            }
+            None => {
+                if self.function.r#async {
+                    shim_ret_ty = quote! {
+                        #wasm_bindgen::convert::WasmRet<<#promise as #wasm_bindgen::convert::FromWasmAbi>::Abi>
+                    };
+                    shim_ret_expr = quote! { core::ptr::read(#marker_call as _) };
+                    // async functions always return a JsValue at the ABI level.
+                    describe_ret = quote! {
+                        <#wasm_bindgen::JsValue as #wasm_bindgen::describe::WasmDescribe>::describe();
+                    };
+                    let future = quote! {
+                        #futures::JsFuture::from(
+                            <#promise as #wasm_bindgen::convert::FromWasmAbi>
+                                ::from_abi(#ret_ident.join())
+                        ).await
+                    };
+                    convert_ret = if self.catch {
+                        quote! { #future?; Ok(()) }
+                    } else {
+                        quote! { #future.expect("uncaught exception"); }
+                    };
+                } else {
+                    shim_ret_ty = quote! { () };
+                    shim_ret_expr = quote! { let _ = #marker_call; };
+                    describe_ret = quote! {
+                        <() as #wasm_bindgen::describe::WasmDescribe>::describe();
+                    };
+                    convert_ret = quote! { () };
+                }
+            }
+        }
+
+        let mut exceptional_ret = quote!();
+        if self.catch && !self.function.r#async {
+            convert_ret = quote! { Ok(#convert_ret) };
+            exceptional_ret = quote! {
+                #wasm_bindgen::__rt::take_last_exception()?;
+            };
         }
 
         // --- Descriptor stream: [key string][FUNCTION signature] ---
@@ -2603,6 +2772,10 @@ impl ast::ImportFunction {
         let vis = &self.function.rust_vis;
         let rust_name = &self.rust_name;
         let attrs = &self.function.rust_attrs;
+        let ret = match self.function.ret.as_ref().map(|r| &r.r#type) {
+            Some(ty) => quote! { -> #ty },
+            None => quote!(),
+        };
         let doc = if self.doc_comment.is_empty() {
             quote! {}
         } else {
@@ -2610,26 +2783,39 @@ impl ast::ImportFunction {
             quote! { #[doc = #doc_comment] }
         };
         let generic_params = &self.generics.params;
-        let turbofish = quote! { ::<#(#type_params),*> };
+        let where_clause = if where_bounds.is_empty() {
+            quote! {}
+        } else {
+            quote! { where #(#where_bounds),* }
+        };
+        let me = if is_method {
+            quote! { &self, }
+        } else {
+            quote!()
+        };
+        let maybe_unsafe = if self.function.r#unsafe {
+            Some(quote! { unsafe })
+        } else {
+            None
+        };
+        let maybe_async = if self.function.r#async {
+            Some(quote! { async })
+        } else {
+            None
+        };
 
         let invocation = quote! {
             #[allow(nonstandard_style)]
             #[allow(clippy::all, clippy::nursery, clippy::pedantic, clippy::restriction)]
             #(#attrs)*
             #doc
-            #vis fn #rust_name <#generic_params> (#(#wrapper_args),*)
-            where
-                #(#type_params: #wasm_bindgen::convert::IntoWasmAbi
-                    + #wasm_bindgen::describe::WasmDescribe,)*
-            {
+            #vis #maybe_async #maybe_unsafe fn #rust_name <#generic_params> (#me #(#wrapper_args),*) #ret #where_clause {
                 #[inline(never)]
                 #[cfg_attr(wasm_bindgen_unstable_test_coverage, coverage(off))]
                 unsafe extern "C" fn breaks_if_inlined<#(#type_params),*>(
                     #(#shim_abi_args),*
-                )
-                where
-                    #(#type_params: #wasm_bindgen::convert::IntoWasmAbi
-                        + #wasm_bindgen::describe::WasmDescribe,)*
+                ) -> #shim_ret_ty
+                #where_clause
                 {
                     use #wasm_bindgen::describe::*;
                     // Leading length-prefixed `shim` key identifying the AST
@@ -2641,21 +2827,42 @@ impl ast::ImportFunction {
                     inform(0);
                     inform(#nargs);
                     #(#describe_args)*
-                    <() as WasmDescribe>::describe();
-                    <() as WasmDescribe>::describe();
-                    let _ = #wasm_bindgen::describe::describe_generic_import(
-                        breaks_if_inlined #turbofish as _,
-                        &(#(#all_prim_names,)*) as *const _ as _,
-                    );
+                    #describe_ret
+                    #describe_ret
+                    #shim_ret_expr
                 }
 
                 unsafe {
-                    #(#arg_conversions)*
-                    breaks_if_inlined #turbofish (#(#all_prim_names),*);
+                    let #ret_ident = {
+                        #(#arg_conversions)*
+                        breaks_if_inlined::<#(#type_params),*>(#(#all_prim_names),*)
+                    };
+                    #exceptional_ret
+                    #convert_ret
                 }
             }
         };
-        invocation.to_tokens(tokens);
+
+        if let Some(class) = class {
+            // Strip any generic arguments from the class type's last path
+            // segment so we impl on the bare class (class generics are rejected
+            // above, so this only removes defaulted/elided arguments).
+            let mut class = class;
+            if let syn::Type::Path(syn::TypePath { qself: None, path }) = &mut class {
+                if let Some(segment) = path.segments.last_mut() {
+                    segment.arguments = syn::PathArguments::None;
+                }
+            }
+            quote! {
+                #[automatically_derived]
+                impl #class {
+                    #invocation
+                }
+            }
+            .to_tokens(tokens);
+        } else {
+            invocation.to_tokens(tokens);
+        }
         Ok(())
     }
 }
