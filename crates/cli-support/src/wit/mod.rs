@@ -340,7 +340,10 @@ impl<'a> Context<'a> {
                 (sig_comment, shim, signature, orig_func_ids)
             })
             .collect();
-        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        // Sort primarily by signature comment, but tie-break on the shim key so
+        // the ordering (and thus assigned `__wbindgen_generic_N` indices) is a
+        // total, deterministic order even if two entries share a `sig_comment`.
+        sorted.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
         let mut duplicate_import_map = HashMap::new();
         for (idx, (sig_comment, shim, signature, orig_func_ids)) in sorted.into_iter().enumerate() {
@@ -371,22 +374,7 @@ impl<'a> Context<'a> {
                 let assert_no_shim = meta.assert_no_shim;
 
                 let id = self.import_adapter(import_id, signature, adapter_kind)?;
-
-                let adapter = self.adapters.implements.last().unwrap().2;
-                if catch {
-                    self.aux.imports_with_catch.insert(adapter);
-                    if self.aux.exn_store.is_none() {
-                        self.find_exn_store();
-                    }
-                }
-                if assert_no_shim {
-                    self.aux.imports_with_assert_no_shim.insert(adapter);
-                }
-                if variadic {
-                    self.aux.imports_with_variadic.insert(id);
-                }
-
-                self.aux.import_map.insert(id, aux_import);
+                self.finish_import_binding(id, aux_import, catch, variadic, assert_no_shim);
             }
 
             duplicate_import_map.extend(orig_func_ids.into_iter().map(|f| (f, import_func_id)));
@@ -411,6 +399,14 @@ impl<'a> Context<'a> {
     /// The map provided here is a map where the key is a function id to replace
     /// and the value is what to replace it with.
     fn handle_duplicate_imports(&mut self, map: &HashMap<FunctionId, FunctionId>) {
+        // Nothing to replace: skip the full-module instruction walk entirely.
+        // This matters because this pass now runs a second time for generic
+        // imports (`bind_generic_imports`), so avoiding a redundant traversal
+        // when either map is empty keeps large modules cheap.
+        if map.is_empty() {
+            return;
+        }
+
         struct Replace<'a> {
             map: &'a HashMap<FunctionId, FunctionId>,
         }
@@ -865,7 +861,7 @@ impl<'a> Context<'a> {
             structural,
             function,
             assert_no_shim,
-            generic,
+            generic_per_mono,
         } = function;
         let generate_typescript = import.generate_typescript;
 
@@ -879,7 +875,17 @@ impl<'a> Context<'a> {
         // for a normal import (the logic below is descriptor-independent), so
         // methods, constructors, statics, getters, setters and structural
         // accessors all bind identically to their non-generic counterparts.
-        if generic {
+        if generic_per_mono {
+            // Reexport is applied per named descriptor shim in the normal path;
+            // a generic import has no single shim (one binding is manufactured
+            // per monomorphisation), so reexport has no well-defined target.
+            // Reject it explicitly rather than silently dropping it.
+            if import.reexport.is_some() {
+                bail!(
+                    "#[wasm_bindgen] `generic_per_mono` imports cannot be reexported; \
+                     remove the reexport or use the type-erasure generic path"
+                );
+            }
             let (aux_import, adapter_kind) = match method {
                 Some(data) => {
                     let class =
@@ -1018,17 +1024,34 @@ impl<'a> Context<'a> {
             }
         };
 
-        // Record this for later as it affects JS binding generation, but note
-        // that this doesn't affect the WebIDL interface at all.
+        self.finish_import_binding(id, aux_import, catch, variadic, assert_no_shim);
+
+        Ok(())
+    }
+
+    /// Finalize an import binding shared by the normal ([`import_function`])
+    /// and generic ([`bind_generic_imports`]) paths: record the `catch` /
+    /// `variadic` / `assert_no_shim` flags and register the `AuxImport`.
+    ///
+    /// `id` is the import adapter itself (used for the `variadic` flag), while
+    /// `catch`/`assert_no_shim` apply to the most recently generated adapter
+    /// shim (`self.adapters.implements.last()`); this distinction must be kept
+    /// in sync with `js/mod.rs`. Neither of these affects the WebIDL interface.
+    ///
+    /// [`import_function`]: Self::import_function
+    /// [`bind_generic_imports`]: Self::bind_generic_imports
+    fn finish_import_binding(
+        &mut self,
+        id: AdapterId,
+        aux_import: AuxImport,
+        catch: bool,
+        variadic: bool,
+        assert_no_shim: bool,
+    ) {
         if variadic {
             self.aux.imports_with_variadic.insert(id);
         }
 
-        // Note that `catch`/`assert_no_shim` is applied not to the import
-        // itself but to the adapter shim we generated, so fetch that shim id
-        // and flag it as catch here. This basically just needs to be kept in
-        // sync with `js/mod.rs`.
-        //
         // For `catch` once we see that we'll need an internal intrinsic later
         // for JS glue generation, so be sure to find that here.
         let adapter = self.adapters.implements.last().unwrap().2;
@@ -1043,8 +1066,6 @@ impl<'a> Context<'a> {
         }
 
         self.aux.import_map.insert(id, aux_import);
-
-        Ok(())
     }
 
     /// The `bool` returned indicates whether the imported value should be

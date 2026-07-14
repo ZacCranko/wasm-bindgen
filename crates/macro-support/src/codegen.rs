@@ -2503,6 +2503,18 @@ impl TryToTokens for ast::ImportFunction {
     }
 }
 
+/// Returns `true` if `ty` is a bare, unqualified path referring to one of the
+/// given type parameters (e.g. `T`), as opposed to a compound type that merely
+/// mentions one (e.g. `Vec<T>`, `&T`, `Option<T>`).
+fn is_bare_type_param(ty: &syn::Type, type_param_names: &[&Ident]) -> bool {
+    if let syn::Type::Path(syn::TypePath { qself: None, path }) = ty {
+        if let Some(ident) = path.get_ident() {
+            return type_param_names.contains(&ident);
+        }
+    }
+    false
+}
+
 impl ast::ImportFunction {
     /// Experimental per-monomorphisation codegen for a generic import.
     ///
@@ -2554,7 +2566,6 @@ impl ast::ImportFunction {
                 "generic_per_mono requires at least one type parameter"
             );
         }
-        let type_param_names: Vec<&Ident> = type_params.clone();
 
         // --- Determine the receiver/class shape (mirrors the normal path) ---
         let mut class = None;
@@ -2575,12 +2586,35 @@ impl ast::ImportFunction {
         }
         // Class-level generics require the erasure machinery (`fn_class_generics`).
         if let Some(c) = &class {
-            if generics::uses_generic_params(c, &type_param_names) {
+            if generics::uses_generic_params(c, &type_params) {
                 bail_span!(
                     self.rust_name,
                     "generic_per_mono does not support class-level generic parameters yet; \
                      use the type-erasure generic path instead"
                 );
+            }
+        }
+
+        // A `variadic` import splats its final argument (`...arg`) on the JS
+        // side, which requires that argument to be iterable at runtime. A bare
+        // generic type parameter can monomorphise to a non-iterable scalar
+        // (e.g. `T = u32`), which would emit `...number` and throw a
+        // `TypeError`. Reject it and require a concrete iterable (e.g.
+        // `Vec<T>`) instead. Container types like `Vec<T>`/`[T; N]` still
+        // mention a type parameter but marshal to a spreadable JS array, so
+        // only a bare `T` (single unqualified path segment naming a type
+        // parameter) is rejected here.
+        if self.variadic {
+            if let Some(last) = self.function.arguments.last() {
+                if is_bare_type_param(&last.pat_type.ty, &type_params) {
+                    bail_span!(
+                        last.pat_type.ty,
+                        "generic_per_mono does not support a bare generic type parameter as the \
+                         `variadic` argument, because it can monomorphise to a non-iterable \
+                         scalar; use a concrete iterable such as `Vec<T>` or the type-erasure \
+                         generic path instead"
+                    );
+                }
             }
         }
 
@@ -2613,19 +2647,20 @@ impl ast::ImportFunction {
                 ),
             };
 
-            if generics::uses_generic_params(ty, &type_param_names) {
+            if generics::uses_generic_params(ty, &type_params) {
                 // A reference to a generic type parameter (`&T`) would require a
                 // higher-ranked `for<'a> &'a T: IntoWasmAbi` bound plus impls
                 // that don't generally exist; that case is served by erasure.
-                if let syn::Type::Reference(r) = ty {
-                    if generics::uses_generic_params(&r.elem, &type_param_names) {
-                        bail_span!(
-                            arg.pat_type.ty,
-                            "generic_per_mono does not support references to a generic type \
-                             parameter (`&T`); take the argument by value or use the \
-                             type-erasure generic path"
-                        );
-                    }
+                // This also covers references nested inside other types, e.g.
+                // `Option<&T>`, `(T, &T)`, `[&T; N]`, or `Box<&T>`.
+                if generics::references_generic_param(ty, &type_params) {
+                    bail_span!(
+                        arg.pat_type.ty,
+                        "generic_per_mono does not support references to a generic type \
+                         parameter (`&T`), including when nested inside another type \
+                         (e.g. `Option<&T>`); take the argument by value or use the \
+                         type-erasure generic path"
+                    );
                 }
                 where_bounds.push(quote! {
                     #ty: #wasm_bindgen::convert::IntoWasmAbi + #wasm_bindgen::describe::WasmDescribe
@@ -2681,7 +2716,7 @@ impl ast::ImportFunction {
                 } else {
                     original_ty
                 };
-                if generics::uses_generic_params(ty, &type_param_names) {
+                if generics::uses_generic_params(ty, &type_params) {
                     where_bounds.push(quote! {
                         #ty: #wasm_bindgen::convert::FromWasmAbi
                             + #wasm_bindgen::describe::WasmDescribe

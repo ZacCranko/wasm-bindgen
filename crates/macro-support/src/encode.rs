@@ -389,7 +389,7 @@ fn shared_import_function<'a>(
         // via the `__wbindgen_describe_generic_import` marker rather than a
         // single named descriptor shim. Type-erasure generic imports keep the
         // normal binding path.
-        generic: i.generic_per_mono,
+        generic_per_mono: i.generic_per_mono,
     })
 }
 

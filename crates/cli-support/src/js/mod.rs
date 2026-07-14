@@ -5742,10 +5742,13 @@ addToLibrary({
                     Some(pair) => pair,
                     None => bail!("a function with no arguments cannot be variadic"),
                 };
+                // Parenthesize the splatted argument so that a compound
+                // expression (e.g. a folded cast like `arg >>> 0`) is not
+                // mis-parsed: `...arg >>> 0` binds as `...(arg >>> 0)`.
                 if !args.is_empty() {
-                    format!("{}, ...{last_arg}", args.join(", "))
+                    format!("{}, ...({last_arg})", args.join(", "))
                 } else {
-                    format!("...{last_arg}")
+                    format!("...({last_arg})")
                 }
             })
         };
@@ -5854,6 +5857,9 @@ addToLibrary({
                 assert!(!variadic);
                 assert_eq!(args.len(), 1);
 
+                // Emitted through the shared generic-import pipeline as a
+                // `__wbindgen_generic_*` shim, but this particular one is an
+                // identity cast (returns its argument unchanged).
                 writeln!(prelude, "// Cast intrinsic for `{sig_comment}`.")?;
                 Ok(args[0].clone())
             }

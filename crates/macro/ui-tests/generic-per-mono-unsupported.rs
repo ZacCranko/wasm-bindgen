@@ -18,9 +18,19 @@ extern "C" {
     #[wasm_bindgen(generic_per_mono)]
     fn ref_to_generic<T>(x: &T);
 
+    // Nor is a reference to a generic parameter nested inside another type
+    // (e.g. `Option<&T>`).
+    #[wasm_bindgen(generic_per_mono)]
+    fn nested_ref_to_generic<T>(x: Option<&T>);
+
     // Returning a reference is not supported.
     #[wasm_bindgen(generic_per_mono)]
     fn return_ref<T>(x: T) -> &JsValue;
+
+    // A bare generic type parameter cannot be the `variadic` argument, since it
+    // may monomorphise to a non-iterable scalar.
+    #[wasm_bindgen(generic_per_mono, variadic)]
+    fn variadic_scalar<T>(first: u32, rest: T);
 }
 
 fn main() {}

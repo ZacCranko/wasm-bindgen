@@ -47,7 +47,8 @@ pub struct Interpreter {
     stack_pointer: Option<GlobalId>,
 
     // The stack pointer value at the start of each interpret_descriptor call,
-    // used to validate restoration and to unwind early exits (describe_cast).
+    // used to validate restoration and to unwind early exits
+    // (describe_generic_import).
     stack_pointer_initial: i32,
 
     // Live state of all locally-defined integer globals, snapshotted from the
