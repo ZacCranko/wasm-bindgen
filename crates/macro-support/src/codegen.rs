@@ -2546,12 +2546,6 @@ impl ast::ImportFunction {
                  use the type-erasure generic path instead"
             );
         }
-        if self.generics.const_params().next().is_some() {
-            bail_span!(
-                self.rust_name,
-                "generic_per_mono imports cannot have const generic parameters yet"
-            );
-        }
         let type_params: Vec<&syn::Ident> =
             self.generics.type_params().map(|tp| &tp.ident).collect();
         if type_params.is_empty() {
