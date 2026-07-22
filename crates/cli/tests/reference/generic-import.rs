@@ -26,6 +26,12 @@ extern "C" {
     #[wasm_bindgen(generic_per_mono, js_name = pair)]
     fn pair<T, U>(a: T, b: U);
 
+    // A bare shared reference to a generic type parameter (`&T`). Copyable
+    // referents (`&u32`, `&f64`) marshal by value; `&JsValue` marshals as an
+    // externref. Each instantiation gets its own per-mono shim.
+    #[wasm_bindgen(generic_per_mono, js_name = logRef)]
+    fn log_ref<T>(x: &T);
+
     // `catch` produces a `handleError`-wrapped shim.
     #[wasm_bindgen(generic_per_mono, catch, js_name = tryLog)]
     fn try_log<T>(x: T) -> Result<(), JsValue>;
@@ -48,6 +54,12 @@ extern "C" {
     #[wasm_bindgen(method, generic_per_mono, js_class = "Widget", js_name = set)]
     fn set<T>(this: &Widget, value: T);
 
+    // A generic method taking a bare shared reference `&T`. Here `T`
+    // monomorphises to the JS-handle `Widget`, so `&Widget` marshals via the
+    // handle's `IntoWasmAbi for &Widget` impl.
+    #[wasm_bindgen(method, generic_per_mono, js_class = "Widget", js_name = attach)]
+    fn attach<T>(this: &Widget, other: &T);
+
     // A generic static method. Two instantiations prove distinct per-mono shims
     // for the static path.
     #[wasm_bindgen(static_method_of = Widget, generic_per_mono, js_name = of)]
@@ -68,12 +80,18 @@ pub fn run(widget: &Widget) -> Result<(), JsValue> {
 
     pair(1u32, 2.0f64);
 
+    log_ref(&13u32);
+    log_ref(&14.0f64);
+    log_ref(&JsValue::from("fifteen"));
+
     try_log(7u32)?;
 
     variadic_log(8, vec![9u32, 10u32]);
 
     widget.set(10u32);
     widget.set(11.0f64);
+
+    widget.attach(widget);
 
     let _ = Widget::of(11u32);
     let _ = Widget::of(12.0f64);

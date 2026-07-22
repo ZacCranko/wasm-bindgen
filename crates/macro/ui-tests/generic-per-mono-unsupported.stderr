@@ -10,26 +10,26 @@ error: generic_per_mono requires at least one type parameter
 15 |     fn without_type_param(x: u32);
    |        ^^^^^^^^^^^^^^^^^^
 
-error: generic_per_mono does not support references to a generic type parameter (`&T`), including when nested inside another type (e.g. `Option<&T>`); take the argument by value or use the type-erasure generic path
-  --> ui-tests/generic-per-mono-unsupported.rs:19:29
+error: generic_per_mono only supports a bare shared reference to a generic type parameter (`&T`); mutable references (`&mut T`) and references nested inside another type (e.g. `Option<&T>`) are not supported — take the argument by value or use the type-erasure generic path
+  --> ui-tests/generic-per-mono-unsupported.rs:20:33
    |
-19 |     fn ref_to_generic<T>(x: &T);
-   |                             ^^
+20 |     fn mut_ref_to_generic<T>(x: &mut T);
+   |                                 ^^^^^^
 
-error: generic_per_mono does not support references to a generic type parameter (`&T`), including when nested inside another type (e.g. `Option<&T>`); take the argument by value or use the type-erasure generic path
-  --> ui-tests/generic-per-mono-unsupported.rs:24:36
+error: generic_per_mono only supports a bare shared reference to a generic type parameter (`&T`); mutable references (`&mut T`) and references nested inside another type (e.g. `Option<&T>`) are not supported — take the argument by value or use the type-erasure generic path
+  --> ui-tests/generic-per-mono-unsupported.rs:25:36
    |
-24 |     fn nested_ref_to_generic<T>(x: Option<&T>);
+25 |     fn nested_ref_to_generic<T>(x: Option<&T>);
    |                                    ^^^^^^^^^^
 
 error: cannot return references in #[wasm_bindgen] imports yet
-  --> ui-tests/generic-per-mono-unsupported.rs:28:31
+  --> ui-tests/generic-per-mono-unsupported.rs:29:31
    |
-28 |     fn return_ref<T>(x: T) -> &JsValue;
+29 |     fn return_ref<T>(x: T) -> &JsValue;
    |                               ^^^^^^^^
 
 error: generic_per_mono does not support a bare generic type parameter as the `variadic` argument, because it can monomorphise to a non-iterable scalar; use a concrete iterable such as `Vec<T>` or the type-erasure generic path instead
-  --> ui-tests/generic-per-mono-unsupported.rs:33:45
+  --> ui-tests/generic-per-mono-unsupported.rs:34:45
    |
-33 |     fn variadic_scalar<T>(first: u32, rest: T);
+34 |     fn variadic_scalar<T>(first: u32, rest: T);
    |                                             ^

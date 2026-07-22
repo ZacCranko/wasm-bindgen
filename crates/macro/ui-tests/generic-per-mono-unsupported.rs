@@ -14,9 +14,10 @@ extern "C" {
     #[wasm_bindgen(generic_per_mono)]
     fn without_type_param(x: u32);
 
-    // References to a generic type parameter (`&T`) are not supported.
+    // A bare shared reference to a generic type parameter (`&T`) *is* now
+    // supported, but a mutable reference (`&mut T`) is not.
     #[wasm_bindgen(generic_per_mono)]
-    fn ref_to_generic<T>(x: &T);
+    fn mut_ref_to_generic<T>(x: &mut T);
 
     // Nor is a reference to a generic parameter nested inside another type
     // (e.g. `Option<&T>`).

@@ -2529,12 +2529,15 @@ impl ast::ImportFunction {
     /// Supported: free functions, methods, constructors, static methods,
     /// getters/setters (structural and non-structural), owned arguments
     /// (including generic `T`, `Option<T>`, `Vec<T>`, and concrete
-    /// references/slices/strings), unit and non-unit returns (including a
-    /// generic `-> T`), `catch`, `variadic`, and `async`.
+    /// references/slices/strings), a bare shared reference to a generic type
+    /// parameter (`&T`, passed by value/handle), unit and non-unit returns
+    /// (including a generic `-> T`), `catch`, `variadic`, and `async`.
     ///
     /// Not (yet) supported, and rejected with a diagnostic: lifetime or const
-    /// generic parameters, class-level generic parameters, and references to a
-    /// generic type parameter (`&T`) — these keep using the type-erasure path.
+    /// generic parameters, class-level generic parameters, mutable references
+    /// to a generic type parameter (`&mut T`), and references to a generic
+    /// type parameter nested inside another type (e.g. `Option<&T>`) — these
+    /// keep using the type-erasure path.
     fn try_to_tokens_generic(&self, tokens: &mut TokenStream) -> Result<(), Diagnostic> {
         let wasm_bindgen = &self.wasm_bindgen;
         let wasm_bindgen_futures = &self.wasm_bindgen_futures;
@@ -2648,23 +2651,43 @@ impl ast::ImportFunction {
             };
 
             if generics::uses_generic_params(ty, &type_params) {
-                // A reference to a generic type parameter (`&T`) would require a
-                // higher-ranked `for<'a> &'a T: IntoWasmAbi` bound plus impls
-                // that don't generally exist; that case is served by erasure.
-                // This also covers references nested inside other types, e.g.
-                // `Option<&T>`, `(T, &T)`, `[&T; N]`, or `Box<&T>`.
-                if generics::references_generic_param(ty, &type_params) {
+                // A bare, shared reference to a generic type parameter (`&T`)
+                // is supported: the referent's schema is emitted via `REF`
+                // (`WasmDescribe for &T`), and the value is marshalled by the
+                // referent-generic `IntoWasmAbi` impls (`&Handle`, `&JsValue`,
+                // `&str`, `&[T]`, and the by-copy `&T where T: Copy`). Because
+                // the shim names `<&T as IntoWasmAbi>::Abi` under a late-bound
+                // elided lifetime, the required bound is higher-ranked over
+                // the referent rather than `&T: IntoWasmAbi`.
+                //
+                // Still rejected: `&mut T`, and references nested inside
+                // another type (e.g. `Option<&T>`, `(T, &T)`, `[&T; N]`,
+                // `&&T`), which need the type-erasure path.
+                let top_level_shared_ref = match ty {
+                    syn::Type::Reference(r) if r.mutability.is_none() => {
+                        !generics::references_generic_param(&r.elem, &type_params)
+                    }
+                    _ => false,
+                };
+                if let (true, syn::Type::Reference(r)) = (top_level_shared_ref, ty) {
+                    let elem = &r.elem;
+                    where_bounds.push(quote! {
+                        for<'__wbg> &'__wbg #elem: #wasm_bindgen::convert::IntoWasmAbi
+                            + #wasm_bindgen::describe::WasmDescribe
+                    });
+                } else if generics::references_generic_param(ty, &type_params) {
                     bail_span!(
                         arg.pat_type.ty,
-                        "generic_per_mono does not support references to a generic type \
-                         parameter (`&T`), including when nested inside another type \
-                         (e.g. `Option<&T>`); take the argument by value or use the \
-                         type-erasure generic path"
+                        "generic_per_mono only supports a bare shared reference to a generic \
+                         type parameter (`&T`); mutable references (`&mut T`) and references \
+                         nested inside another type (e.g. `Option<&T>`) are not supported — \
+                         take the argument by value or use the type-erasure generic path"
                     );
+                } else {
+                    where_bounds.push(quote! {
+                        #ty: #wasm_bindgen::convert::IntoWasmAbi + #wasm_bindgen::describe::WasmDescribe
+                    });
                 }
-                where_bounds.push(quote! {
-                    #ty: #wasm_bindgen::convert::IntoWasmAbi + #wasm_bindgen::describe::WasmDescribe
-                });
             }
 
             // For methods the first argument is the receiver, referred to as
