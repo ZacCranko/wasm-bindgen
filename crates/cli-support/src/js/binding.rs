@@ -1891,7 +1891,11 @@ fn instruction(
             match kind {
                 VectorKind::String | VectorKind::Externref | VectorKind::NamedExternref(_) => {
                     let free = js.cx.wasm_export_of(*free);
-                    js.prelude(&format!("v{i} = {f}({ptr}, {len}).slice();"));
+                    // No `.slice()`: the helper already builds a fresh array
+                    // (and drops the externrefs as it reads them), so copying it
+                    // again would be pure overhead. Mirrors the non-`Option`
+                    // `VectorLoadAsArray` arm above.
+                    js.prelude(&format!("v{i} = {f}({ptr}, {len});"));
                     js.prelude(&format!(
                         "{free}({ptr}, {len} * {size}, {size});",
                         size = kind.size()

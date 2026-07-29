@@ -1561,7 +1561,6 @@ fn run_abort_handler_test(
                 [profile.dev]
                 codegen-units = 1
             ",
-            name = name,
             repo = REPO_ROOT.display(),
         ),
     );

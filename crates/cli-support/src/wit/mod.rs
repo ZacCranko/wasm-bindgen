@@ -4,7 +4,6 @@ use crate::descriptors::WasmBindgenDescriptorsSection;
 use crate::intrinsic::Intrinsic;
 use crate::transforms::threads::ThreadCount;
 use crate::{decode, wasm_conventions, Bindgen, PLACEHOLDER_MODULE};
-// Aliased because this module defines its own `Context` struct.
 use anyhow::{anyhow, bail, ensure, Context as _, Error};
 use std::collections::{BTreeSet, HashMap};
 use std::str;
@@ -917,16 +916,31 @@ impl<'a> Context<'a> {
                     )
                 }
             };
-            self.generic_import_bindings.insert(
-                shim.to_string(),
-                GenericImportMeta {
-                    aux_import,
-                    adapter_kind,
-                    catch,
-                    variadic,
-                    assert_no_shim,
-                },
-            );
+            // The shim key is a hash over `(namespace, signature, module,
+            // cfg_attrs)`, so a collision needs two AST entries with the same
+            // Rust fn name, js_name and module. It should be impossible, but
+            // silently keeping only one of them would mis-bind every
+            // monomorphisation of the other (they can differ in `catch` /
+            // `variadic` / the resolved JS import), so refuse instead.
+            if self
+                .generic_import_bindings
+                .insert(
+                    shim.to_string(),
+                    GenericImportMeta {
+                        aux_import,
+                        adapter_kind,
+                        catch,
+                        variadic,
+                        assert_no_shim,
+                    },
+                )
+                .is_some()
+            {
+                bail!(
+                    "two generic imports collided on the shim key `{shim}`; this is a \
+                     wasm-bindgen bug, please report it"
+                );
+            }
             return Ok(());
         }
 
@@ -1744,11 +1758,30 @@ impl<'a> Context<'a> {
         let memory64 = self.memory64();
         self.normalize_memory64_signature(&mut signature, core_id);
 
+        // Name this import in any binding failure below. `__wbindgen_generic_N`
+        // is a sort index assigned by `bind_generic_imports` and means nothing to
+        // a user, but those functions carry the originating shim key (and
+        // signature) as their walrus name, so prefer that.
+        let display_name = if import_name.starts_with("__wbindgen_generic_") {
+            self.module
+                .funcs
+                .get(core_id)
+                .name
+                .as_deref()
+                .and_then(|n| n.split(": ").next())
+                .unwrap_or(&import_name)
+                .to_string()
+        } else {
+            import_name.clone()
+        };
+
         // Process the returned type first to see if it needs an out-pointer. This
         // happens if the results of the incoming arguments translated to Wasm take
         // up more than one type.
         let mut ret = self.instruction_builder(true);
-        ret.incoming(&signature.ret)?;
+        ret.incoming(&signature.ret).with_context(|| {
+            format!("failed to generate a binding for the return value of `{display_name}`")
+        })?;
         let uses_retptr = ret.output.len() > 1;
 
         // Process the argument next, allocating space of the return value if one
@@ -1763,17 +1796,12 @@ impl<'a> Context<'a> {
             });
         }
         for (i, arg) in signature.arguments.iter().enumerate() {
-            // Attach the import symbol and the argument position: without this
-            // an unsupported argument type is reported as a bare "unsupported
-            // ... type" line with nothing to locate it by, which is painful
-            // when a crate has hundreds of imports (and doubly so for the
-            // per-monomorphisation generic imports, where the offending
-            // signature is synthesised rather than written by hand).
+            // Without this an unsupported type is reported with nothing to locate
+            // it by. Note the closure form keeps the happy path allocation-free.
             args.outgoing(arg).with_context(|| {
                 format!(
-                    "failed to generate a binding for argument {} of imported function `{}`",
-                    i + 1,
-                    import_name
+                    "failed to generate a binding for argument {} of `{display_name}`",
+                    i + 1
                 )
             })?;
         }
@@ -1877,24 +1905,37 @@ impl<'a> Context<'a> {
         };
         self.normalize_memory64_signature(&mut signature, core_id);
 
+        // Name the export in any binding failure below; see `import_adapter` for
+        // why this context matters.
+        let export_name = self.module.exports.get(export).name.clone();
+
         // Figure out how to translate all the incoming arguments ...
         let mut args = self.instruction_builder(false);
-        for arg in signature.arguments.iter() {
-            args.incoming(arg)?;
+        for (i, arg) in signature.arguments.iter().enumerate() {
+            args.incoming(arg).with_context(|| {
+                format!(
+                    "failed to generate a binding for argument {} of `{export_name}`",
+                    i + 1
+                )
+            })?;
         }
 
         // ... then the returned value being translated back
 
         let inner_ret_output = if let Some(sig_inner_ret) = &signature.inner_ret {
             let mut inner_ret = args.cx.instruction_builder(true);
-            inner_ret.outgoing(sig_inner_ret)?;
+            inner_ret.outgoing(sig_inner_ret).with_context(|| {
+                format!("failed to generate a binding for the return value of `{export_name}`")
+            })?;
             inner_ret.output
         } else {
             vec![]
         };
 
         let mut ret = args.cx.instruction_builder(true);
-        ret.outgoing(&signature.ret)?;
+        ret.outgoing(&signature.ret).with_context(|| {
+            format!("failed to generate a binding for the return value of `{export_name}`")
+        })?;
         let uses_retptr = ret.input.len() > 1;
 
         // Our instruction stream starts out with the return pointer as the first
