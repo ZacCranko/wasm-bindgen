@@ -36,6 +36,7 @@ pub mod enums;
 pub mod final_;
 pub mod futures;
 pub mod gc;
+pub mod generic_import_async;
 pub mod generic_import_ref;
 pub mod generics;
 pub mod getters_and_setters;

@@ -33,14 +33,30 @@ extern "C" {
     #[wasm_bindgen(generic_per_mono, variadic)]
     fn variadic_scalar<T>(first: u32, rest: T);
 
-    // An `async` import resolves its `Promise` to a `JsValue`, so the return
-    // type cannot mention a type parameter.
-    #[wasm_bindgen(generic_per_mono)]
-    async fn async_generic_ret<T>(x: T) -> T;
-
-    // Same, through the `Ok` type of a `catch` import.
+    // `catch` hard-codes the error type to `JsValue` and monomorphises only the
+    // `Ok` type, so a type parameter in the error position is rejected.
     #[wasm_bindgen(generic_per_mono, catch)]
-    async fn async_catch_generic_ret<T>(x: T) -> Result<T, JsValue>;
+    fn catch_generic_err<T>(x: T) -> Result<JsValue, T>;
+
+    // `slice_to_array` needs a concrete element type: `VectorRefIntoWasmAbi` is
+    // implemented per concrete ABI shape, so no bound makes `&[T]` work.
+    #[wasm_bindgen(generic_per_mono, slice_to_array)]
+    fn slice_to_array_generic_elem<T>(xs: &[T], other: T);
+
+    // Also rejected when only nested inside the element type...
+    #[wasm_bindgen(generic_per_mono, slice_to_array)]
+    fn slice_to_array_nested_elem<T>(xs: &[Vec<T>], other: T);
+
+    // ...and through the `Option<&[T]>` form.
+    #[wasm_bindgen(generic_per_mono, slice_to_array)]
+    fn slice_to_array_option_elem<T>(xs: Option<&[T]>, other: T);
+}
+
+// `slice_to_array` is inherited from the enclosing block, and the same rejection
+// applies on the type-erasure generic path, which has no `generic_per_mono`.
+#[wasm_bindgen(slice_to_array)]
+extern "C" {
+    fn erased_slice_to_array_generic_elem<T>(xs: &[T]);
 }
 
 fn main() {}

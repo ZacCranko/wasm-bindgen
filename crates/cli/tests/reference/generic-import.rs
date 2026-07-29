@@ -45,13 +45,45 @@ extern "C" {
 
     // `slice_to_array` hands JS a plain `Array` it owns rather than a
     // typed-array view into wasm memory. The slice element type must be
-    // concrete (a `&[T]` argument is rejected by the reference guard), so the
-    // rewrite is independent of which monomorphisation is being generated.
+    // concrete, so the rewrite is independent of which monomorphisation is
+    // being generated.
     #[wasm_bindgen(generic_per_mono, slice_to_array, js_name = logSlice)]
     fn log_slice<T>(xs: &[u16], other: T);
 
     #[wasm_bindgen(generic_per_mono, slice_to_array, js_name = logOptSlice)]
     fn log_opt_slice<T>(xs: Option<&[u16]>, other: T);
+
+    // A `String` element type takes the *other* ownership path: JS receives a
+    // freshly allocated index buffer that it must free, unlike the primitive
+    // case above which borrows the caller's slice.
+    #[wasm_bindgen(generic_per_mono, slice_to_array, js_name = logStrSlice)]
+    fn log_str_slice<T>(xs: &[String], other: T);
+
+    #[wasm_bindgen(generic_per_mono, slice_to_array, js_name = logOptStrSlice)]
+    fn log_opt_str_slice<T>(xs: Option<&[String]>, other: T);
+
+    // `async` imports return a `Promise` across the ABI whatever they resolve
+    // to, so the descriptor is an externref and the resolved value is converted
+    // separately inside `JsFuture<T>`. That makes a monomorphised `-> T` work,
+    // including for a `T` that is not itself handle-shaped.
+    #[wasm_bindgen(generic_per_mono, js_name = asyncIdentity)]
+    async fn async_identity<T>(x: T) -> T;
+
+    // Same, but resolving to a concrete non-handle type.
+    #[wasm_bindgen(generic_per_mono, js_name = asyncCount)]
+    async fn async_count<T>(x: T) -> u32;
+
+    // And through the `Ok` type of a `catch` import.
+    #[wasm_bindgen(generic_per_mono, catch, js_name = asyncTry)]
+    async fn async_try<T>(x: T) -> Result<T, JsValue>;
+}
+
+// `slice_to_array` is inheritable from the enclosing block and applies to every
+// slice-shaped argument of every function it covers, `generic_per_mono` included.
+#[wasm_bindgen(slice_to_array)]
+extern "C" {
+    #[wasm_bindgen(generic_per_mono, js_name = logBlockSlice)]
+    fn log_block_slice<T>(xs: &[u16], other: T);
 }
 
 #[wasm_bindgen]
@@ -77,7 +109,7 @@ extern "C" {
 }
 
 #[wasm_bindgen]
-pub fn run(widget: &Widget) -> Result<(), JsValue> {
+pub async fn run(widget: &Widget) -> Result<(), JsValue> {
     log_generic(1u32);
     log_generic(2.0f64);
     log_generic(String::from("three"));
@@ -102,6 +134,15 @@ pub fn run(widget: &Widget) -> Result<(), JsValue> {
     log_slice(&[3u16, 4u16], 10.0f64);
     log_opt_slice(Some(&[5u16]), 11u32);
     log_opt_slice(None, 12u32);
+    log_str_slice(&[String::from("a")], 13u32);
+    log_opt_str_slice(Some(&[String::from("b")]), 18u32);
+    log_opt_str_slice(None, 19u32);
+    log_block_slice(&[6u16], 14u32);
+
+    let _: u32 = async_identity(15u32).await;
+    let _: String = async_identity(String::from("b")).await;
+    let _: u32 = async_count(16u32).await;
+    let _: u32 = async_try(17u32).await?;
 
     widget.set(10u32);
     widget.set(11.0f64);

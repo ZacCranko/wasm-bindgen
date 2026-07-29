@@ -34,14 +34,32 @@ error: generic_per_mono does not support a bare generic type parameter as the `v
 34 |     fn variadic_scalar<T>(first: u32, rest: T);
    |                                             ^
 
-error: generic_per_mono does not support an `async` import whose return type mentions a type parameter, because the resolved value of the `Promise` is always a `JsValue` and cannot be monomorphised; return `JsValue` (or a concrete imported JS type) and convert it yourself, or use the type-erasure generic path instead
-  --> ui-tests/generic-per-mono-unsupported.rs:39:44
+error: the error type of a `catch` import must be `JsValue`, not a type parameter; only the `Ok` type is monomorphised
+  --> ui-tests/generic-per-mono-unsupported.rs:39:54
    |
-39 |     async fn async_generic_ret<T>(x: T) -> T;
-   |                                            ^
+39 |     fn catch_generic_err<T>(x: T) -> Result<JsValue, T>;
+   |                                                      ^
 
-error: generic_per_mono does not support an `async` import whose return type mentions a type parameter, because the resolved value of the `Promise` is always a `JsValue` and cannot be monomorphised; return `JsValue` (or a concrete imported JS type) and convert it yourself, or use the type-erasure generic path instead
-  --> ui-tests/generic-per-mono-unsupported.rs:43:57
+error: `slice_to_array` requires a concrete slice element type (e.g. `&[u16]`); a type parameter cannot work here because `VectorRefIntoWasmAbi` is implemented per concrete ABI shape — drop `slice_to_array`, or take the argument by value
+  --> ui-tests/generic-per-mono-unsupported.rs:44:43
    |
-43 |     async fn async_catch_generic_ret<T>(x: T) -> Result<T, JsValue>;
-   |                                                         ^
+44 |     fn slice_to_array_generic_elem<T>(xs: &[T], other: T);
+   |                                           ^^^^
+
+error: `slice_to_array` requires a concrete slice element type (e.g. `&[u16]`); a type parameter cannot work here because `VectorRefIntoWasmAbi` is implemented per concrete ABI shape — drop `slice_to_array`, or take the argument by value
+  --> ui-tests/generic-per-mono-unsupported.rs:48:42
+   |
+48 |     fn slice_to_array_nested_elem<T>(xs: &[Vec<T>], other: T);
+   |                                          ^^^^^^^^^
+
+error: `slice_to_array` requires a concrete slice element type (e.g. `&[u16]`); a type parameter cannot work here because `VectorRefIntoWasmAbi` is implemented per concrete ABI shape — drop `slice_to_array`, or take the argument by value
+  --> ui-tests/generic-per-mono-unsupported.rs:52:42
+   |
+52 |     fn slice_to_array_option_elem<T>(xs: Option<&[T]>, other: T);
+   |                                          ^^^^^^^^^^^^
+
+error: `slice_to_array` requires a concrete slice element type (e.g. `&[u16]`); a type parameter cannot work here because `VectorRefIntoWasmAbi` is implemented per concrete ABI shape — drop `slice_to_array`, or take the argument by value
+  --> ui-tests/generic-per-mono-unsupported.rs:59:50
+   |
+59 |     fn erased_slice_to_array_generic_elem<T>(xs: &[T]);
+   |                                                  ^^^^

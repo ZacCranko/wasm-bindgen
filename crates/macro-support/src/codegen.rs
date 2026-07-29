@@ -2209,59 +2209,16 @@ impl TryToTokens for ast::ImportFunction {
                 convert_arg = quote! { #var };
             }
 
-            // `slice_to_array`: re-route an `&[T]` (or `Option<&[T]>`)
-            // outgoing argument through `<T as VectorRefIntoWasmAbi>`
-            // instead of the default `&[T]: IntoWasmAbi`. The user-facing
-            // parameter is unchanged; only the ABI / describe path
-            // changes. `VectorRefIntoWasmAbi`'s impls cover the two
-            // genuine ABI shapes (zero-copy primitive borrow,
-            // fresh-`Box<[u32]>` for handle-shaped element types) — no
-            // `T: Clone` bound is introduced.
-            //
-            // Wire format is `WasmSlice` either way; the cli-support
-            // side picks the right JS shim based on the element
-            // `VectorKind` recovered from the descriptor.
-            // `slice_to_array` is set per-fn or per-`extern "C"` block
-            // and applies to every `&[T]` / `Option<&[T]>` argument of
-            // every fn it covers. Args that aren't slice-shaped (e.g.
-            // the `this: &Foo` of a method, or any other non-slice
-            // argument of a slice_to_array fn) silently fall through to
-            // the default ABI path — there's no per-arg opt-out form
-            // in Rust attribute syntax to require, so silent no-op is
-            // the only sensible behaviour.
-            if arg.slice_to_array && detect_slice_or_option_slice(ty).is_some() {
-                let (elem_ty, is_option) = detect_slice_or_option_slice(ty).unwrap();
-
-                let abi = quote! { #wasm_bindgen::convert::WasmSlice };
-                let (prim_args, prim_names) = splat(wasm_bindgen, &name, &abi);
-                abi_arguments.extend(prim_args);
-                abi_argument_names.extend(prim_names.iter().cloned());
-
-                let body = if is_option {
-                    quote! {
-                        match #var {
-                            ::core::option::Option::Some(s) =>
-                                <#elem_ty as #wasm_bindgen::convert::VectorRefIntoWasmAbi>
-                                    ::slice_into_abi(s),
-                            ::core::option::Option::None =>
-                                <#elem_ty as #wasm_bindgen::convert::VectorRefIntoWasmAbi>
-                                    ::slice_none(),
-                        }
-                    }
-                } else {
-                    quote! {
-                        <#elem_ty as #wasm_bindgen::convert::VectorRefIntoWasmAbi>
-                            ::slice_into_abi(#var)
-                    }
-                };
-
-                arg_conversions.push(quote! {
-                    let #name: #wasm_bindgen::convert::WasmSlice = #body;
-                    let (#(#prim_names),*) =
-                        <#wasm_bindgen::convert::WasmSlice as #wasm_bindgen::convert::WasmAbi>
-                            ::split(#name);
-                });
-                continue;
+            // `slice_to_array`: hand JS an owned `Array` instead of a
+            // typed-array view. See `slice_to_array_rewrite`.
+            if arg.slice_to_array {
+                check_slice_to_array_concrete_elem(arg, ty, &fn_generic_param_names)?;
+                if let Some(rewrite) = slice_to_array_rewrite(wasm_bindgen, &name, &var, ty) {
+                    abi_arguments.extend(rewrite.abi_args);
+                    abi_argument_names.extend(rewrite.prim_names);
+                    arg_conversions.push(rewrite.conversion);
+                    continue;
+                }
             }
 
             let abi = quote! { <#abi_ty as #wasm_bindgen::convert::IntoWasmAbi>::Abi };
@@ -2531,13 +2488,24 @@ impl ast::ImportFunction {
     /// (including generic `T`, `Option<T>`, `Vec<T>`, and concrete
     /// references/slices/strings), a bare shared reference to a generic type
     /// parameter (`&T`, passed by value/handle), unit and non-unit returns
-    /// (including a generic `-> T`), `catch`, `variadic`, and `async`.
+    /// (including a generic `-> T`), `catch`, `variadic`, `async` (including a
+    /// generic `-> T`, since the value crossing the ABI is the `Promise` and the
+    /// resolved value is converted inside `JsFuture<T>`), and `slice_to_array`
+    /// for slices with a concrete element type.
     ///
-    /// Not (yet) supported, and rejected with a diagnostic: lifetime or const
-    /// generic parameters, class-level generic parameters, mutable references
-    /// to a generic type parameter (`&mut T`), and references to a generic
-    /// type parameter nested inside another type (e.g. `Option<&T>`) — these
-    /// keep using the type-erasure path.
+    /// Not (yet) supported, and rejected with a diagnostic:
+    /// - lifetime or const generic parameters, and class-level generic
+    ///   parameters;
+    /// - a mutable reference to a generic type parameter (`&mut T`), or a
+    ///   reference to one nested inside another type (e.g. `Option<&T>`);
+    /// - a bare generic type parameter as the `variadic` argument, which may
+    ///   monomorphise to a non-iterable scalar;
+    /// - a type parameter in the error position of a `catch` import, since only
+    ///   the `Ok` type is monomorphised;
+    /// - `slice_to_array` on a slice whose element type mentions a type
+    ///   parameter.
+    ///
+    /// The rejected shapes generally keep working on the type-erasure path.
     fn try_to_tokens_generic(&self, tokens: &mut TokenStream) -> Result<(), Diagnostic> {
         let wasm_bindgen = &self.wasm_bindgen;
         let wasm_bindgen_futures = &self.wasm_bindgen_futures;
@@ -2621,6 +2589,35 @@ impl ast::ImportFunction {
             }
         }
 
+        // `slice_to_array` needs a concrete element type. Checked up front rather
+        // than in the argument loop so that the bail happens before any `where`
+        // bound is recorded for the argument.
+        for arg in self.function.arguments.iter() {
+            check_slice_to_array_concrete_elem(arg, &arg.pat_type.ty, &type_params)?;
+        }
+
+        // `catch` keeps only the `Ok` type and hard-codes the error to `JsValue`
+        // (see `extract_first_ty_param` in the parser), so the `?` the codegen
+        // emits would need `T: From<JsValue>`. A type parameter in the error
+        // position therefore surfaces as "`?` couldn't convert the error to `T`"
+        // pointing at `#[wasm_bindgen]`. Reject it with the error type's own span.
+        if self.catch {
+            if let Some(err_ty) = self
+                .function
+                .ret
+                .as_ref()
+                .and_then(|ret| result_err_ty(&ret.r#type))
+            {
+                if generics::uses_generic_params(err_ty, &type_params) {
+                    bail_span!(
+                        err_ty,
+                        "the error type of a `catch` import must be `JsValue`, not a type \
+                         parameter; only the `Ok` type is monomorphised"
+                    );
+                }
+            }
+        }
+
         // --- Per-argument wrapper signature, ABI splat, describe, and bounds ---
         //
         // Each type param stays concrete via rustc monomorphisation, so args are
@@ -2655,7 +2652,7 @@ impl ast::ImportFunction {
                 // is supported: the referent's schema is emitted via `REF`
                 // (`WasmDescribe for &T`), and the value is marshalled by the
                 // referent-generic `IntoWasmAbi` impls (`&Handle`, `&JsValue`,
-                // `&str`, `&[T]`, and the by-copy `&T where T: Copy`). Because
+                // `&str`, `&[T]`, and `&T where T: ScalarIntoWasmAbi`). Because
                 // the shim names `<&T as IntoWasmAbi>::Abi` under a late-bound
                 // elided lifetime, the required bound is higher-ranked over
                 // the referent rather than `&T: IntoWasmAbi`.
@@ -2663,6 +2660,11 @@ impl ast::ImportFunction {
                 // Still rejected: `&mut T`, and references nested inside
                 // another type (e.g. `Option<&T>`, `(T, &T)`, `[&T; N]`,
                 // `&&T`), which need the type-erasure path.
+                //
+                // Note this cannot fire for an argument the `slice_to_array`
+                // rewrite below will take over: such an argument must have a
+                // concrete element type (checked before the loop), so it never
+                // mentions a type parameter and no bound is recorded for it.
                 let top_level_shared_ref = match ty {
                     syn::Type::Reference(r) if r.mutability.is_none() => {
                         !generics::references_generic_param(&r.elem, &type_params)
@@ -2699,58 +2701,15 @@ impl ast::ImportFunction {
                 quote! { #name }
             };
 
-            // `slice_to_array`: mirror the ABI and describe rewrite that
-            // `ImportFunction::try_to_tokens` performs, so that the attribute
-            // means the same thing on this path (hand JS a plain `Array` it
-            // owns, rather than a typed-array view into wasm memory). Without
-            // this the attribute was silently ignored here and JS received a
-            // view.
-            //
-            // Only concrete slice element types can reach this point: a slice
-            // whose element mentions a type parameter (`&[T]`) is already
-            // rejected by the bare-shared-reference guard above, so there is no
-            // interaction with monomorphisation to worry about. As on the
-            // normal path, arguments that are not slice-shaped under a fn- or
-            // block-level `slice_to_array` fall through to the default ABI.
+            // `slice_to_array`: hand JS an owned `Array` instead of a
+            // typed-array view, exactly as on the normal import path. Before
+            // this was wired up the attribute was silently ignored here.
             if arg.slice_to_array {
-                if let Some((elem_ty, is_option)) = detect_slice_or_option_slice(ty) {
-                    let abi = quote! { #wasm_bindgen::convert::WasmSlice };
-                    let (args, names) = splat(wasm_bindgen, &name, &abi);
-                    shim_abi_args.extend(args);
-
-                    let body = if is_option {
-                        quote! {
-                            match #var {
-                                ::core::option::Option::Some(s) =>
-                                    <#elem_ty as #wasm_bindgen::convert::VectorRefIntoWasmAbi>
-                                        ::slice_into_abi(s),
-                                ::core::option::Option::None =>
-                                    <#elem_ty as #wasm_bindgen::convert::VectorRefIntoWasmAbi>
-                                        ::slice_none(),
-                            }
-                        }
-                    } else {
-                        quote! {
-                            <#elem_ty as #wasm_bindgen::convert::VectorRefIntoWasmAbi>
-                                ::slice_into_abi(#var)
-                        }
-                    };
-                    arg_conversions.push(quote! {
-                        let #name: #wasm_bindgen::convert::WasmSlice = #body;
-                        let (#(#names),*) =
-                            <#wasm_bindgen::convert::WasmSlice as #wasm_bindgen::convert::WasmAbi>
-                                ::split(#name);
-                    });
-                    all_prim_names.extend(names);
-
-                    // Describe through `&Vec<T>` / `Option<&Vec<T>>` so the
-                    // descriptor is `Ref(Vector(T))`, which cli-support turns
-                    // into the owned-`Array` shim.
-                    let describe_ty: syn::Type = if is_option {
-                        parse_quote! { ::core::option::Option<&::std::vec::Vec<#elem_ty>> }
-                    } else {
-                        parse_quote! { &::std::vec::Vec<#elem_ty> }
-                    };
+                if let Some(rewrite) = slice_to_array_rewrite(wasm_bindgen, &name, &var, ty) {
+                    shim_abi_args.extend(rewrite.abi_args);
+                    all_prim_names.extend(rewrite.prim_names);
+                    arg_conversions.push(rewrite.conversion);
+                    let describe_ty = rewrite.describe_ty;
                     describe_args.push(quote! {
                         <#describe_ty as #wasm_bindgen::describe::WasmDescribe>::describe();
                     });
@@ -2791,23 +2750,6 @@ impl ast::ImportFunction {
                 );
             }
             Some(original_ty) => {
-                // An `async` import always resolves its `Promise` to a
-                // `JsValue`, so there is nothing to monomorphise on: the
-                // returned value's type is fixed by JS, not by `T`. Letting
-                // this through only produces a confusing trait-solver error
-                // pointing at `JsFuture<T>`, so reject it here with the span
-                // of the offending return type instead.
-                if self.function.r#async && generics::uses_generic_params(original_ty, &type_params)
-                {
-                    bail_span!(
-                        original_ty,
-                        "generic_per_mono does not support an `async` import whose return type \
-                         mentions a type parameter, because the resolved value of the `Promise` \
-                         is always a `JsValue` and cannot be monomorphised; return `JsValue` (or \
-                         a concrete imported JS type) and convert it yourself, or use the \
-                         type-erasure generic path instead"
-                    );
-                }
                 let maybe_async_wrapped;
                 let ty = if self.function.r#async {
                     maybe_async_wrapped = parse_quote!(#promise<#original_ty>);
@@ -2815,7 +2757,18 @@ impl ast::ImportFunction {
                 } else {
                     original_ty
                 };
-                if generics::uses_generic_params(ty, &type_params) {
+                if self.function.r#async {
+                    // The resolved value of the promise crosses the closure seam
+                    // inside `JsFuture<T>` via `T::from_abi`, so an `async` import
+                    // *can* return a monomorphised `T` — the bound that makes
+                    // `JsFuture<T>: From<Promise<T>>` hold is the one below, not
+                    // `T: WasmDescribe`.
+                    if generics::uses_generic_params(original_ty, &type_params) {
+                        where_bounds.push(quote! {
+                            #original_ty: #wasm_bindgen::convert::FromWasmAbi + 'static
+                        });
+                    }
+                } else if generics::uses_generic_params(ty, &type_params) {
                     where_bounds.push(quote! {
                         #ty: #wasm_bindgen::convert::FromWasmAbi
                             + #wasm_bindgen::describe::WasmDescribe
@@ -2825,10 +2778,25 @@ impl ast::ImportFunction {
                     #wasm_bindgen::convert::WasmRet<<#ty as #wasm_bindgen::convert::FromWasmAbi>::Abi>
                 };
                 shim_ret_expr = quote! { core::ptr::read(#marker_call as _) };
-                // The descriptor describes the user-facing (inner) return type,
-                // matching the normal path's `DescribeImport`.
-                describe_ret = quote! {
-                    <#original_ty as #wasm_bindgen::describe::WasmDescribe>::describe();
+                describe_ret = if self.function.r#async {
+                    // The value that actually crosses the ABI is the `Promise`
+                    // handle — an externref — *not* the resolved inner value, so
+                    // that is what the descriptor has to say. Describing the
+                    // inner type here instead makes cli-support marshal the
+                    // promise as if it were a `T`, which silently produces
+                    // garbage for any `T` that is not itself handle-shaped.
+                    //
+                    // (The normal import path still describes the inner type at
+                    // `DescribeImport`, and so still mis-marshals e.g.
+                    // `async fn f() -> u32`. Fixing that is a separate,
+                    // snapshot-churning change.)
+                    quote! {
+                        <#wasm_bindgen::JsValue as #wasm_bindgen::describe::WasmDescribe>::describe();
+                    }
+                } else {
+                    quote! {
+                        <#original_ty as #wasm_bindgen::describe::WasmDescribe>::describe();
+                    }
                 };
                 convert_ret = quote! {
                     <#ty as #wasm_bindgen::convert::FromWasmAbi>::from_abi(#ret_ident.join())
@@ -3356,23 +3324,13 @@ impl TryToTokens for DescribeImport<'_> {
                     &fn_class_generics.concrete_defaults,
                     &fn_lifetime_params,
                 )?;
-                // For `slice_to_array` args, describe through `&Vec<T>` (or
-                // `Option<&Vec<T>>`) to match the ABI rewrite in
-                // `ImportFunction::try_to_tokens` — the descriptor shape is
-                // `Ref(Vector(T))`, which the cli-support side recognises.
-                // Non-slice args (e.g. `this: &Foo` of a method) under a
-                // fn- or block-level `slice_to_array` silently fall through
-                // to their default describe — slice_to_array is a mode that
-                // only acts on slice-shaped args.
+                // Must match the ABI rewrite in `ImportFunction::try_to_tokens`;
+                // both go through the same helper. Non-slice args under a fn- or
+                // block-level `slice_to_array` fall through to their default
+                // describe.
                 if arg.slice_to_array {
-                    if let Some((elem_ty, is_option)) = detect_slice_or_option_slice(&ty) {
-                        if is_option {
-                            return Ok(parse_quote! {
-                                ::core::option::Option<&::std::vec::Vec<#elem_ty>>
-                            });
-                        } else {
-                            return Ok(parse_quote! { &::std::vec::Vec<#elem_ty> });
-                        }
+                    if let Some(describe_ty) = slice_to_array_describe_ty(self.wasm_bindgen, &ty) {
+                        return Ok(describe_ty);
                     }
                 }
                 Ok(ty)
@@ -3380,6 +3338,10 @@ impl TryToTokens for DescribeImport<'_> {
             .collect::<Result<Vec<syn::Type>, Diagnostic>>()?;
         let nargs = f.function.arguments.len() as u32;
         let inform_ret = match &f.js_ret {
+            // An `async` import returns a `Promise` across the ABI regardless of
+            // what it resolves to, so the descriptor must say externref. The
+            // resolved value is converted separately, inside `JsFuture<T>`.
+            Some(_) if f.function.r#async => quote! { <JsValue as WasmDescribe>::describe(); },
             Some(ref t) => {
                 let t = generics::generic_to_concrete(
                     t.clone(),
@@ -3845,6 +3807,160 @@ fn detect_slice_or_option_slice(ty: &syn::Type) -> Option<(syn::Type, bool)> {
         }
     }
     None
+}
+
+/// The error type `E` of a `Result<T, E>` return type, if `ty` looks like a
+/// `Result` with two type arguments.
+///
+/// Best-effort and purely syntactic, like the rest of the `catch` handling: a
+/// `Result` alias or a re-ordered alias will not be recognised, which only means
+/// a diagnostic is skipped.
+fn result_err_ty(ty: &syn::Type) -> Option<&syn::Type> {
+    let syn::Type::Path(syn::TypePath { qself: None, path }) = get_ty(ty) else {
+        return None;
+    };
+    let syn::PathArguments::AngleBracketed(args) = &path.segments.last()?.arguments else {
+        return None;
+    };
+    if args.args.len() != 2 {
+        return None;
+    }
+    match &args.args[1] {
+        syn::GenericArgument::Type(t) => Some(t),
+        _ => None,
+    }
+}
+
+/// The type to hand `WasmDescribe::describe` for a `slice_to_array` argument,
+/// or `None` if `ty` is not slice-shaped.
+///
+/// Describing through `&Vec<T>` / `Option<&Vec<T>>` makes the descriptor
+/// `Ref(Vector(T))` / `Option(Ref(Vector(T)))`, which is what cli-support
+/// recognises as "hand JS an owned `Array`" rather than "hand JS a typed-array
+/// view". This must stay in lockstep with the ABI rewrite in
+/// [`slice_to_array_rewrite`]: the descriptor is what selects the JS shim, and
+/// the ABI is what the shim is handed.
+fn slice_to_array_describe_ty(wasm_bindgen: &syn::Path, ty: &syn::Type) -> Option<syn::Type> {
+    let (elem_ty, is_option) = detect_slice_or_option_slice(ty)?;
+    // `alloc`, not `std`: `wasm-bindgen` is `#![no_std]` and supports `no_std`
+    // consumers, so generated code must never name `::std`.
+    let vec = quote! { #wasm_bindgen::__rt::alloc::vec::Vec };
+    Some(if is_option {
+        parse_quote! { ::core::option::Option<&#vec<#elem_ty>> }
+    } else {
+        parse_quote! { &#vec<#elem_ty> }
+    })
+}
+
+/// The pieces of the `slice_to_array` rewrite for one argument.
+struct SliceToArrayRewrite {
+    /// Flattened wasm ABI parameters to splice into the shim signature.
+    abi_args: Vec<TokenStream>,
+    /// The names `conversion` binds, in ABI order.
+    prim_names: Vec<Ident>,
+    /// Statements converting the user-facing argument into `prim_names`.
+    conversion: TokenStream,
+    /// The type to describe, per [`slice_to_array_describe_ty`].
+    describe_ty: syn::Type,
+}
+
+/// Build the `slice_to_array` rewrite for one argument, or `None` if `ty` is not
+/// slice-shaped (`&[T]` / `Option<&[T]>`).
+///
+/// This re-routes the argument through `<T as VectorRefIntoWasmAbi>` instead of
+/// the default `&[T]: IntoWasmAbi`. The user-facing parameter is unchanged; only
+/// the ABI and describe paths move. `VectorRefIntoWasmAbi`'s impls cover the two
+/// genuine ABI shapes (zero-copy borrow for primitive elements, freshly
+/// allocated `Box<[u32]>` for handle-shaped ones), so no `T: Clone` bound is
+/// introduced. The wire format is `WasmSlice` either way; cli-support picks the
+/// right JS shim from the element `VectorKind` in the descriptor.
+///
+/// `slice_to_array` is set per-fn or per-`extern "C"` block and applies to every
+/// slice-shaped argument of every fn it covers. Arguments that are not
+/// slice-shaped (the `this: &Foo` receiver of a method, a `Vec<T>`, any scalar)
+/// return `None` and take the default ABI path — there is no per-argument
+/// opt-out in Rust attribute syntax to require, so a silent no-op is the only
+/// sensible behaviour.
+///
+/// Note that mutability is ignored (see [`detect_slice_or_option_slice`]), so
+/// `&mut [T]` is rewritten too and silently loses write-back semantics.
+fn slice_to_array_rewrite(
+    wasm_bindgen: &syn::Path,
+    name: &Ident,
+    var: &TokenStream,
+    ty: &syn::Type,
+) -> Option<SliceToArrayRewrite> {
+    let (elem_ty, is_option) = detect_slice_or_option_slice(ty)?;
+    let describe_ty = slice_to_array_describe_ty(wasm_bindgen, ty)?;
+
+    let abi = quote! { #wasm_bindgen::convert::WasmSlice };
+    let (abi_args, prim_names) = splat(wasm_bindgen, name, &abi);
+
+    let body = if is_option {
+        quote! {
+            match #var {
+                ::core::option::Option::Some(s) =>
+                    <#elem_ty as #wasm_bindgen::convert::VectorRefIntoWasmAbi>
+                        ::slice_into_abi(s),
+                ::core::option::Option::None =>
+                    <#elem_ty as #wasm_bindgen::convert::VectorRefIntoWasmAbi>
+                        ::slice_none(),
+            }
+        }
+    } else {
+        quote! {
+            <#elem_ty as #wasm_bindgen::convert::VectorRefIntoWasmAbi>
+                ::slice_into_abi(#var)
+        }
+    };
+    let conversion = quote! {
+        let #name: #wasm_bindgen::convert::WasmSlice = #body;
+        let (#(#prim_names),*) =
+            <#wasm_bindgen::convert::WasmSlice as #wasm_bindgen::convert::WasmAbi>
+                ::split(#name);
+    };
+
+    Some(SliceToArrayRewrite {
+        abi_args,
+        prim_names,
+        conversion,
+        describe_ty,
+    })
+}
+
+/// Reject `slice_to_array` on a slice whose element type mentions a type
+/// parameter.
+///
+/// The rewrite names `<#elem_ty as VectorRefIntoWasmAbi>` and describes through
+/// `&Vec<#elem_ty>`, neither of which a bare type parameter can satisfy — and no
+/// bound the user can write makes it satisfiable, because the blanket
+/// `VectorRefIntoWasmAbi` impls are keyed on concrete ABI shapes. Left
+/// unchecked, the user sees two `E0277`s naming private traits plus a
+/// syntactically invalid `help:` suggestion, so bail with a span instead.
+///
+/// This matters on both import paths: `slice_to_array` is inheritable from the
+/// enclosing `extern "C"` block, so a user who never wrote it on this argument
+/// can still hit it.
+fn check_slice_to_array_concrete_elem(
+    arg: &ast::FunctionArgumentData,
+    ty: &syn::Type,
+    type_param_names: &Vec<&Ident>,
+) -> Result<(), Diagnostic> {
+    if !arg.slice_to_array || type_param_names.is_empty() {
+        return Ok(());
+    }
+    let Some((elem_ty, _)) = detect_slice_or_option_slice(ty) else {
+        return Ok(());
+    };
+    if generics::uses_generic_params(&elem_ty, type_param_names) {
+        bail_span!(
+            arg.pat_type.ty,
+            "`slice_to_array` requires a concrete slice element type (e.g. `&[u16]`); a type \
+             parameter cannot work here because `VectorRefIntoWasmAbi` is implemented per \
+             concrete ABI shape — drop `slice_to_array`, or take the argument by value"
+        );
+    }
+    Ok(())
 }
 
 fn detect_raw_fn_trait_obj(

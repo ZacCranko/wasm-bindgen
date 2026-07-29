@@ -72,6 +72,22 @@ fresh JS string.
   type — `&[ExportedT]` remains unsupported. Use `Vec<ExportedT>` to
   transfer ownership of a sequence of exported struct values to JS.
 * It does **not** change the semantics of owned `Vec<T>`. Owned vectors
-  passed by value continue to use their existing wire format.
+  passed by value continue to use their existing wire format. Because
+  `Vec<T>` is not slice-shaped, `slice_to_array` is a silent no-op on
+  such an argument (as it is on any other non-slice argument, such as
+  the `this` receiver of a method).
 * It does **not** affect the default `&[T]` (zero-copy typed-array view)
   behaviour for functions where `slice_to_array` was not opted into.
+* It does **not** work with a generic element type. `&[T]` for a type
+  parameter `T` is rejected at compile time, because
+  `VectorRefIntoWasmAbi` is implemented per concrete ABI shape and no
+  bound the caller can write makes an arbitrary `T` satisfy it. This
+  applies on both the type-erasure generic path and
+  `generic_per_mono`; the element type must be concrete, e.g.
+  `&[u16]`. Note that `slice_to_array` is inheritable from the
+  enclosing `extern "C"` block, so a generic function in such a block
+  must not take a `&[T]` argument.
+* It does **not** silently lose `&mut [T]`'s contents, but it does
+  silently ignore its write-back: a `&mut [T]` argument is rewritten
+  just like `&[T]`, and mutations JS makes to the `Array` are not
+  reflected back into the caller's slice.
