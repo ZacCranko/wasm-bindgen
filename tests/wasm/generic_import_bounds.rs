@@ -12,6 +12,13 @@
 //! bound in scope there, that projection does not resolve. `compile-fail`
 //! coverage for callers that violate a bound lives in
 //! `crates/macro/ui-tests/generic-per-mono-bounds.rs`.
+//!
+//! Alongside the purpose-built `Wire` trait, real library traits are exercised
+//! (`Iterator`, `IntoIterator`, `ExactSizeIterator`), because they have shapes a
+//! hand-rolled trait does not: their bound paths carry generic arguments
+//! (`Iterator<Item = u32>`, `AsRef<[u32]>`), and a projection off them can
+//! resolve through a supertrait rather than the named trait itself. Those
+//! arguments must survive verbatim into both the wrapper and the shim.
 
 use wasm_bindgen::convert::{FromWasmAbi, IntoWasmAbi};
 use wasm_bindgen::describe::WasmDescribe;
@@ -72,6 +79,51 @@ extern "C" {
     where
         for<'a> &'a T: Clone,
         T: Clone;
+
+    // --- Real library traits ---
+
+    // Inline bound on a real trait whose path carries an associated-type
+    // binding. `T` is named nowhere else in the signature, so callers turbofish
+    // and the binding is what makes the argument's type concrete.
+    #[wasm_bindgen(generic_per_mono, js_name = record)]
+    fn record_iter_item<T: Iterator<Item = u32>>(x: T::Item);
+
+    // The same trait as a `where` predicate, with the projection left open in
+    // both argument and return position: the bound has to reach the shim for
+    // `T::Item`'s ABI to resolve there.
+    #[wasm_bindgen(generic_per_mono, js_name = echo)]
+    fn echo_iter_item<T>(x: T::Item) -> T::Item
+    where
+        T: Iterator;
+
+    // Only `ExactSizeIterator` is named, so `T::Item` resolves through its
+    // `Iterator` supertrait rather than the bound's own trait.
+    #[wasm_bindgen(generic_per_mono, js_name = echo)]
+    fn echo_exact_size_item<T>(x: T::Item) -> T::Item
+    where
+        T: ExactSizeIterator;
+
+    // A predicate whose bounded type is a projection rather than a bare
+    // parameter, next to the bound that makes the projection nameable.
+    #[wasm_bindgen(generic_per_mono, js_name = echo)]
+    fn echo_cloneable_item<T>(x: T::Item) -> T::Item
+    where
+        T: Iterator,
+        T::Item: Clone;
+
+    // Here the bounded parameter is itself the value crossing the ABI, so the
+    // user's bounds and the synthesized `IntoWasmAbi`/`WasmDescribe` ones land
+    // on the same parameter. `AsRef<[u32]>` also puts a plain type argument
+    // (rather than an associated-type binding) in a bound path.
+    #[wasm_bindgen(generic_per_mono, js_name = sumAll)]
+    fn sum_all<T: IntoIterator<Item = u32> + AsRef<[u32]>>(xs: T) -> f64;
+
+    // Higher-ranked predicate over a real trait: it is the *reference* that must
+    // be iterable, which `T: IntoIterator` alone would not give.
+    #[wasm_bindgen(generic_per_mono, js_name = sumAll)]
+    fn sum_all_by_ref<T>(xs: T) -> f64
+    where
+        for<'a> &'a T: IntoIterator;
 }
 
 /// A caller that must itself satisfy the import's bounds to name `T::Wire`.
@@ -119,4 +171,57 @@ fn generic_import_associated_type_through_bound() {
 fn generic_import_higher_ranked_bound() {
     assert_eq!(echo_hrtb(4u32), 4u32);
     assert_eq!(echo_hrtb(String::from("h")), String::from("h"));
+}
+
+#[wasm_bindgen_test]
+fn generic_import_iterator_bound() {
+    let _ = take_log();
+    // `Range<u32>: Iterator<Item = u32>`, so the argument is a `u32`.
+    record_iter_item::<core::ops::Range<u32>>(11);
+    record_iter_item::<core::ops::Range<u32>>(12);
+    assert_eq!(take_log(), "11,12");
+}
+
+#[wasm_bindgen_test]
+fn generic_import_iterator_item_round_trip() {
+    assert_eq!(echo_iter_item::<core::ops::Range<u32>>(13u32), 13u32);
+    assert_eq!(
+        echo_iter_item::<std::vec::IntoIter<String>>(String::from("item")),
+        String::from("item")
+    );
+}
+
+#[wasm_bindgen_test]
+fn generic_import_supertrait_projection() {
+    // `Range<u32>` is not `ExactSizeIterator` on a 32-bit target, so pick an
+    // iterator that is one everywhere.
+    assert_eq!(
+        echo_exact_size_item::<std::vec::IntoIter<u32>>(14u32),
+        14u32
+    );
+    assert_eq!(
+        echo_exact_size_item::<std::vec::IntoIter<String>>(String::from("exact")),
+        String::from("exact")
+    );
+}
+
+#[wasm_bindgen_test]
+fn generic_import_bound_on_projection() {
+    assert_eq!(echo_cloneable_item::<core::ops::Range<u32>>(15u32), 15u32);
+    assert_eq!(
+        echo_cloneable_item::<std::vec::IntoIter<String>>(String::from("clone")),
+        String::from("clone")
+    );
+}
+
+#[wasm_bindgen_test]
+fn generic_import_into_iterator_bound() {
+    // `T` is inferred here, since the bounded parameter is the argument itself.
+    assert_eq!(sum_all(vec![1u32, 2, 3]), 6.0);
+    assert_eq!(sum_all(Vec::<u32>::new()), 0.0);
+}
+
+#[wasm_bindgen_test]
+fn generic_import_higher_ranked_real_trait_bound() {
+    assert_eq!(sum_all_by_ref(vec![4u32, 5]), 9.0);
 }

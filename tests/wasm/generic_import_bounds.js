@@ -6,6 +6,14 @@ exports.sum = function(a, b) {
   return Number(a) + Number(b);
 };
 
+exports.sumAll = function(xs) {
+  let total = 0;
+  for (const x of xs) {
+    total += Number(x);
+  }
+  return total;
+};
+
 let log = [];
 
 exports.record = function(x) {
