@@ -26,19 +26,34 @@ export function __wbindgen_generic_0000000000000003(arg0) {
     const ret = identity(arg0 >>> 0);
     return ret;
 }
-export function __wbindgen_generic_0000000000000004(arg0) {
-    logRef(arg0);
+export function __wbindgen_generic_0000000000000004(arg0, arg1, arg2) {
+    let v0;
+    if (arg0 !== 0) {
+        v0 = Array.from(getArrayU16FromWasm0(arg0, arg1));
+    }
+    logOptSlice(v0, arg2 >>> 0);
 }
 export function __wbindgen_generic_0000000000000005(arg0) {
     logRef(arg0);
 }
 export function __wbindgen_generic_0000000000000006(arg0) {
-    logRef(arg0 >>> 0);
+    logRef(arg0);
 }
 export function __wbindgen_generic_0000000000000007(arg0) {
+    logRef(arg0 >>> 0);
+}
+export function __wbindgen_generic_0000000000000008(arg0, arg1, arg2) {
+    var v0 = Array.from(getArrayU16FromWasm0(arg0, arg1));
+    logSlice(v0, arg2);
+}
+export function __wbindgen_generic_0000000000000009(arg0, arg1, arg2) {
+    var v0 = Array.from(getArrayU16FromWasm0(arg0, arg1));
+    logSlice(v0, arg2 >>> 0);
+}
+export function __wbindgen_generic_000000000000000a(arg0) {
     log(arg0);
 }
-export function __wbindgen_generic_0000000000000008(arg0, arg1) {
+export function __wbindgen_generic_000000000000000b(arg0, arg1) {
     let deferred0_0;
     let deferred0_1;
     try {
@@ -49,36 +64,36 @@ export function __wbindgen_generic_0000000000000008(arg0, arg1) {
         wasm.__wbindgen_free(deferred0_0, deferred0_1, 1);
     }
 }
-export function __wbindgen_generic_0000000000000009(arg0) {
+export function __wbindgen_generic_000000000000000c(arg0) {
     log(arg0 >>> 0);
 }
-export function __wbindgen_generic_000000000000000a(arg0, arg1) {
+export function __wbindgen_generic_000000000000000d(arg0, arg1) {
     mix(arg0 >>> 0, arg1);
 }
-export function __wbindgen_generic_000000000000000b(arg0, arg1) {
+export function __wbindgen_generic_000000000000000e(arg0, arg1) {
     mix(arg0 >>> 0, arg1 >>> 0);
 }
-export function __wbindgen_generic_000000000000000c(arg0) {
+export function __wbindgen_generic_000000000000000f(arg0) {
     const ret = Widget.of(arg0);
     return ret;
 }
-export function __wbindgen_generic_000000000000000d(arg0) {
+export function __wbindgen_generic_0000000000000010(arg0) {
     const ret = Widget.of(arg0 >>> 0);
     return ret;
 }
-export function __wbindgen_generic_000000000000000e(arg0, arg1) {
+export function __wbindgen_generic_0000000000000011(arg0, arg1) {
     pair(arg0 >>> 0, arg1);
 }
-export function __wbindgen_generic_000000000000000f(arg0, arg1) {
+export function __wbindgen_generic_0000000000000012(arg0, arg1) {
     arg0.set(arg1);
 }
-export function __wbindgen_generic_0000000000000010(arg0, arg1) {
+export function __wbindgen_generic_0000000000000013(arg0, arg1) {
     arg0.set(arg1 >>> 0);
 }
-export function __wbindgen_generic_0000000000000011() { return handleError(function (arg0) {
+export function __wbindgen_generic_0000000000000014() { return handleError(function (arg0) {
     tryLog(arg0 >>> 0);
 }, arguments); }
-export function __wbindgen_generic_0000000000000012(arg0, arg1, arg2) {
+export function __wbindgen_generic_0000000000000015(arg0, arg1, arg2) {
     var v0 = getArrayU32FromWasm0(arg1, arg2).slice();
     wasm.__wbindgen_free(arg1, arg2 * 4, 4);
     variadicLog(arg0 >>> 0, ...(v0));
@@ -98,6 +113,11 @@ function addToExternrefTable0(obj) {
     return idx;
 }
 
+function getArrayU16FromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    return getUint16ArrayMemory0().subarray(ptr / 2, ptr / 2 + len);
+}
+
 function getArrayU32FromWasm0(ptr, len) {
     ptr = ptr >>> 0;
     return getUint32ArrayMemory0().subarray(ptr / 4, ptr / 4 + len);
@@ -105,6 +125,14 @@ function getArrayU32FromWasm0(ptr, len) {
 
 function getStringFromWasm0(ptr, len) {
     return decodeText(ptr >>> 0, len);
+}
+
+let cachedUint16ArrayMemory0 = null;
+function getUint16ArrayMemory0() {
+    if (cachedUint16ArrayMemory0 === null || cachedUint16ArrayMemory0.byteLength === 0) {
+        cachedUint16ArrayMemory0 = new Uint16Array(wasm.memory.buffer);
+    }
+    return cachedUint16ArrayMemory0;
 }
 
 let cachedUint32ArrayMemory0 = null;

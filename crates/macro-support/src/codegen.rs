@@ -2699,6 +2699,65 @@ impl ast::ImportFunction {
                 quote! { #name }
             };
 
+            // `slice_to_array`: mirror the ABI and describe rewrite that
+            // `ImportFunction::try_to_tokens` performs, so that the attribute
+            // means the same thing on this path (hand JS a plain `Array` it
+            // owns, rather than a typed-array view into wasm memory). Without
+            // this the attribute was silently ignored here and JS received a
+            // view.
+            //
+            // Only concrete slice element types can reach this point: a slice
+            // whose element mentions a type parameter (`&[T]`) is already
+            // rejected by the bare-shared-reference guard above, so there is no
+            // interaction with monomorphisation to worry about. As on the
+            // normal path, arguments that are not slice-shaped under a fn- or
+            // block-level `slice_to_array` fall through to the default ABI.
+            if arg.slice_to_array {
+                if let Some((elem_ty, is_option)) = detect_slice_or_option_slice(ty) {
+                    let abi = quote! { #wasm_bindgen::convert::WasmSlice };
+                    let (args, names) = splat(wasm_bindgen, &name, &abi);
+                    shim_abi_args.extend(args);
+
+                    let body = if is_option {
+                        quote! {
+                            match #var {
+                                ::core::option::Option::Some(s) =>
+                                    <#elem_ty as #wasm_bindgen::convert::VectorRefIntoWasmAbi>
+                                        ::slice_into_abi(s),
+                                ::core::option::Option::None =>
+                                    <#elem_ty as #wasm_bindgen::convert::VectorRefIntoWasmAbi>
+                                        ::slice_none(),
+                            }
+                        }
+                    } else {
+                        quote! {
+                            <#elem_ty as #wasm_bindgen::convert::VectorRefIntoWasmAbi>
+                                ::slice_into_abi(#var)
+                        }
+                    };
+                    arg_conversions.push(quote! {
+                        let #name: #wasm_bindgen::convert::WasmSlice = #body;
+                        let (#(#names),*) =
+                            <#wasm_bindgen::convert::WasmSlice as #wasm_bindgen::convert::WasmAbi>
+                                ::split(#name);
+                    });
+                    all_prim_names.extend(names);
+
+                    // Describe through `&Vec<T>` / `Option<&Vec<T>>` so the
+                    // descriptor is `Ref(Vector(T))`, which cli-support turns
+                    // into the owned-`Array` shim.
+                    let describe_ty: syn::Type = if is_option {
+                        parse_quote! { ::core::option::Option<&::std::vec::Vec<#elem_ty>> }
+                    } else {
+                        parse_quote! { &::std::vec::Vec<#elem_ty> }
+                    };
+                    describe_args.push(quote! {
+                        <#describe_ty as #wasm_bindgen::describe::WasmDescribe>::describe();
+                    });
+                    continue;
+                }
+            }
+
             let abi = quote! { <#ty as #wasm_bindgen::convert::IntoWasmAbi>::Abi };
             let (args, names) = splat(wasm_bindgen, &name, &abi);
             shim_abi_args.extend(args);

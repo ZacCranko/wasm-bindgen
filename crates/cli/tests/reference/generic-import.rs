@@ -42,6 +42,16 @@ extern "C" {
     // non-iterable scalar.
     #[wasm_bindgen(generic_per_mono, variadic, js_name = variadicLog)]
     fn variadic_log<T>(first: u32, rest: Vec<T>);
+
+    // `slice_to_array` hands JS a plain `Array` it owns rather than a
+    // typed-array view into wasm memory. The slice element type must be
+    // concrete (a `&[T]` argument is rejected by the reference guard), so the
+    // rewrite is independent of which monomorphisation is being generated.
+    #[wasm_bindgen(generic_per_mono, slice_to_array, js_name = logSlice)]
+    fn log_slice<T>(xs: &[u16], other: T);
+
+    #[wasm_bindgen(generic_per_mono, slice_to_array, js_name = logOptSlice)]
+    fn log_opt_slice<T>(xs: Option<&[u16]>, other: T);
 }
 
 #[wasm_bindgen]
@@ -87,6 +97,11 @@ pub fn run(widget: &Widget) -> Result<(), JsValue> {
     try_log(7u32)?;
 
     variadic_log(8, vec![9u32, 10u32]);
+
+    log_slice(&[1u16, 2u16], 9u32);
+    log_slice(&[3u16, 4u16], 10.0f64);
+    log_opt_slice(Some(&[5u16]), 11u32);
+    log_opt_slice(None, 12u32);
 
     widget.set(10u32);
     widget.set(11.0f64);
