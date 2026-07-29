@@ -336,6 +336,23 @@ impl InstructionBuilder<'_, '_> {
                 self.outgoing(arg)?;
             }
 
+            // A reference to a `#[wasm_bindgen]`-exported Rust struct. This
+            // arm only exists to produce a decent diagnostic: the Rust side
+            // compiles fine because of the blanket
+            // `impl<T: Copy + IntoWasmAbi> IntoWasmAbi for &T`, which makes
+            // `&SomeCopyStruct` pass the *copied struct's* pointer ABI, but
+            // there is no wire representation for handing a borrowed Rust
+            // struct to JS, so the failure only shows up here.
+            Descriptor::RustStruct(name) => {
+                let r = if mutable { "&mut " } else { "&" };
+                bail!(
+                    "cannot pass `{r}{name}` to JS: a `#[wasm_bindgen]` struct cannot be passed \
+                     to a JS function by reference, because JS has no way to borrow it. Pass it \
+                     by value (`{name}`) and let JS own the handle, or expose the individual \
+                     fields or a getter and pass those instead."
+                )
+            }
+
             _ => bail!(
                 "unsupported reference argument type for calling JS function from Rust: {arg:?}"
             ),

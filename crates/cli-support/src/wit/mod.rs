@@ -4,7 +4,8 @@ use crate::descriptors::WasmBindgenDescriptorsSection;
 use crate::intrinsic::Intrinsic;
 use crate::transforms::threads::ThreadCount;
 use crate::{decode, wasm_conventions, Bindgen, PLACEHOLDER_MODULE};
-use anyhow::{anyhow, bail, ensure, Error};
+// Aliased because this module defines its own `Context` struct.
+use anyhow::{anyhow, bail, ensure, Context as _, Error};
 use std::collections::{BTreeSet, HashMap};
 use std::str;
 use walrus::ir::VisitorMut;
@@ -1761,8 +1762,20 @@ impl<'a> Context<'a> {
                 AdapterType::I32
             });
         }
-        for arg in signature.arguments.iter() {
-            args.outgoing(arg)?;
+        for (i, arg) in signature.arguments.iter().enumerate() {
+            // Attach the import symbol and the argument position: without this
+            // an unsupported argument type is reported as a bare "unsupported
+            // ... type" line with nothing to locate it by, which is painful
+            // when a crate has hundreds of imports (and doubly so for the
+            // per-monomorphisation generic imports, where the offending
+            // signature is synthesised rather than written by hand).
+            args.outgoing(arg).with_context(|| {
+                format!(
+                    "failed to generate a binding for argument {} of imported function `{}`",
+                    i + 1,
+                    import_name
+                )
+            })?;
         }
 
         // Build up the list of instructions for our adapter function. We start out
