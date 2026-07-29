@@ -2493,6 +2493,12 @@ impl ast::ImportFunction {
     /// resolved value is converted inside `JsFuture<T>`), and `slice_to_array`
     /// for slices with a concrete element type.
     ///
+    /// User-written trait bounds, both inline (`fn f<T: Trait>`) and in a `where`
+    /// clause (including higher-ranked predicates), are part of the declared
+    /// contract and are carried through to the generated wrapper, so callers must
+    /// satisfy them. They also reach the monomorphised shim, whose ABI signature
+    /// may project associated types off a bounded parameter.
+    ///
     /// Not (yet) supported, and rejected with a diagnostic:
     /// - lifetime or const generic parameters, and class-level generic
     ///   parameters;
@@ -2625,7 +2631,21 @@ impl ast::ImportFunction {
         // erasure). We add a `where` bound for exactly the arg/return types that
         // mention a type parameter (bounding concrete types would be a trivial
         // bound, which is an error on stable).
-        let mut where_bounds: Vec<TokenStream> = Vec::new();
+        //
+        // The user's own bounds are part of the declared signature's contract, so
+        // they are carried through verbatim ahead of the synthesized ones: callers
+        // are then held to them by rustc, and any associated type they unlock
+        // (e.g. `T::Assoc` in an argument) resolves in both the wrapper and the
+        // monomorphised shim. Inline bounds (`fn f<T: Trait>`) ride along with the
+        // parameter list; `where` predicates have no such carrier and are
+        // collected here.
+        let mut where_bounds: Vec<TokenStream> = self
+            .generics
+            .where_clause
+            .iter()
+            .flat_map(|where_clause| where_clause.predicates.iter())
+            .map(ToTokens::to_token_stream)
+            .collect();
         let mut wrapper_args = Vec::new();
         let mut shim_abi_args = Vec::new();
         let mut all_prim_names = Vec::new();
@@ -2876,6 +2896,12 @@ impl ast::ImportFunction {
             quote! { #[doc = #doc_comment] }
         };
         let generic_params = &self.generics.params;
+        // The shim redeclares the wrapper's type parameters, so it needs their
+        // inline bounds too: its signature names ABI types projected off them
+        // (`<T::Assoc as IntoWasmAbi>::Abi`), which only resolve under the bound.
+        // Defaults are dropped here (they are meaningless on a nested item, and
+        // are diagnosed on the wrapper's own parameter list).
+        let shim_generic_params = generics::type_params_with_bounds(&self.generics);
         let where_clause = if where_bounds.is_empty() {
             quote! {}
         } else {
@@ -2905,7 +2931,7 @@ impl ast::ImportFunction {
             #vis #maybe_async #maybe_unsafe fn #rust_name <#generic_params> (#me #(#wrapper_args),*) #ret #where_clause {
                 #[inline(never)]
                 #[cfg_attr(wasm_bindgen_unstable_test_coverage, coverage(off))]
-                unsafe extern "C" fn breaks_if_inlined<#(#type_params),*>(
+                unsafe extern "C" fn breaks_if_inlined<#(#shim_generic_params),*>(
                     #(#shim_abi_args),*
                 ) -> #shim_ret_ty
                 #where_clause

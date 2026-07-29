@@ -1,0 +1,40 @@
+error[E0277]: the trait bound `u32: Marker` is not satisfied
+  --> ui-tests/generic-per-mono-bounds.rs:32:18
+   |
+32 |     inline_bound(1u32);
+   |     ------------ ^^^^ the trait `Marker` is not implemented for `u32`
+   |     |
+   |     required by a bound introduced by this call
+   |
+help: this trait has no implementations, consider adding one
+  --> ui-tests/generic-per-mono-bounds.rs:18:1
+   |
+18 | trait Marker {}
+   | ^^^^^^^^^^^^
+note: required by a bound in `inline_bound`
+  --> ui-tests/generic-per-mono-bounds.rs:23:24
+   |
+23 |     fn inline_bound<T: Marker>(x: T);
+   |                        ^^^^^^ required by this bound in `inline_bound`
+
+error[E0277]: the trait bound `u32: Marker` is not satisfied
+  --> ui-tests/generic-per-mono-bounds.rs:36:17
+   |
+36 |     where_bound(2u32);
+   |     ----------- ^^^^ the trait `Marker` is not implemented for `u32`
+   |     |
+   |     required by a bound introduced by this call
+   |
+help: this trait has no implementations, consider adding one
+  --> ui-tests/generic-per-mono-bounds.rs:18:1
+   |
+18 | trait Marker {}
+   | ^^^^^^^^^^^^
+note: required by a bound in `where_bound`
+  --> ui-tests/generic-per-mono-bounds.rs:28:12
+   |
+26 |     fn where_bound<T>(x: T)
+   |        ----------- required by a bound in this function
+27 |     where
+28 |         T: Marker;
+   |            ^^^^^^ required by this bound in `where_bound`
