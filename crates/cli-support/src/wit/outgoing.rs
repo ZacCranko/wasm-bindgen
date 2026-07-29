@@ -265,11 +265,15 @@ impl InstructionBuilder<'_, '_> {
 
             // `slice_to_array` argument: the macro rewrites a user-facing
             // `&[T]` into a `&Vec<T>` ABI call, which describes as
-            // `Ref(Vector(T))`. The Rust side cloned the slice contents
-            // into a freshly-allocated buffer JS owns and must free. The
-            // wire format matches `Vec<T>` (transferred ownership), but
-            // the JS-visible type is a plain `Array` rather than a typed
-            // array — emit `VectorLoadAsArray` for primitive kinds.
+            // `Ref(Vector(T))`. The JS-visible type is a plain `Array`
+            // rather than a typed array, so emit `VectorLoadAsArray`.
+            //
+            // Ownership depends on the element kind and is decided when
+            // the instruction is rendered (see `VectorLoadAsArray` in
+            // `js/binding.rs`): primitive elements are a *borrow* of the
+            // caller's slice and are never freed, while string/externref
+            // elements arrive in a freshly allocated index buffer that JS
+            // owns and must free.
             //
             // This arm is currently produced exclusively by the
             // `slice_to_array` codegen (`&Box<[T]>` has no `IntoWasmAbi`
@@ -336,25 +340,17 @@ impl InstructionBuilder<'_, '_> {
                 self.outgoing(arg)?;
             }
 
-            // A reference to a `#[wasm_bindgen]`-exported Rust struct. This
-            // arm only exists to produce a decent diagnostic: the Rust side
-            // compiles fine because of the blanket
-            // `impl<T: Copy + IntoWasmAbi> IntoWasmAbi for &T`, which makes
-            // `&SomeCopyStruct` pass the *copied struct's* pointer ABI, but
-            // there is no wire representation for handing a borrowed Rust
-            // struct to JS, so the failure only shows up here.
-            Descriptor::RustStruct(name) => {
-                let r = if mutable { "&mut " } else { "&" };
-                bail!(
-                    "cannot pass `{r}{name}` to JS: a `#[wasm_bindgen]` struct cannot be passed \
-                     to a JS function by reference, because JS has no way to borrow it. Pass it \
-                     by value (`{name}`) and let JS own the handle, or expose the individual \
-                     fields or a getter and pass those instead."
-                )
-            }
-
+            // Reaching here means `&T: IntoWasmAbi` held on the Rust side for a
+            // `T` that has no by-reference wire representation. `ScalarIntoWasmAbi`
+            // is meant to keep that set in lockstep with the arms above, so this
+            // is either a type that opted into `ScalarIntoWasmAbi` without really
+            // being scalar, or the two lists have drifted. Say what *is*
+            // supported rather than only dumping the internal descriptor.
             _ => bail!(
-                "unsupported reference argument type for calling JS function from Rust: {arg:?}"
+                "unsupported type behind a reference when passing a value to JS: {arg:?}. \
+                 Only scalars, `JsValue`, imported JS types, strings, slices and \
+                 `&dyn Fn`/`&mut dyn FnMut` closures can cross the boundary by \
+                 reference — pass anything else by value"
             ),
         }
         Ok(())

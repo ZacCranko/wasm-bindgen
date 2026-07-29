@@ -162,6 +162,33 @@ pub trait OptionFromWasmAbi: FromWasmAbi {
     fn is_none(abi: &Self::Abi) -> bool;
 }
 
+/// Marker for the types whose shared reference can be handed to JS by copying
+/// the value: `&T: IntoWasmAbi` is provided for exactly these `T`.
+///
+/// JS has no way to hold a reference into linear memory, so `&T` can only be
+/// passed by copying `T` across the boundary. That is sound for a scalar, whose
+/// wire representation is the same whether it is passed by value or by
+/// reference, but not for a type with an identity or an owner — a
+/// `#[wasm_bindgen]` struct passed as `&T` would silently hand JS a *distinct*
+/// copy with its own `free()` obligation, so that the `&` conveys nothing and
+/// JS-side mutation is invisible to the caller.
+///
+/// This deliberately mirrors, exactly, the set of descriptors the CLI accepts
+/// behind a `Ref(..)` when generating a call into JS (see `outgoing_ref` in
+/// `wasm-bindgen-cli-support`). Keeping the two in lockstep is what turns "the
+/// CLI cannot bind this" into a call-site trait error the user can act on.
+///
+/// The trait is not sealed: if you have hand-written `Copy + IntoWasmAbi` for a
+/// type whose ABI really is a scalar, you can opt in with
+/// `impl ScalarIntoWasmAbi for MyType {}`.
+///
+/// # ⚠️ Unstable
+///
+/// This is part of the internal [`convert`](crate::convert) module, **no
+/// stability guarantees** are provided. Use at your own risk. See its
+/// documentation for more details.
+pub trait ScalarIntoWasmAbi: Copy + IntoWasmAbi {}
+
 /// A trait for any type which maps to a Wasm primitive type when used in FFI
 /// (`i32`, `i64`, `f32`, or `f64`).
 ///

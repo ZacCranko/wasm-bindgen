@@ -6,7 +6,7 @@ use core::ptr::NonNull;
 
 use crate::__rt::marker::ErasableGeneric;
 use crate::__rt::{WasmSignedWordRepr, WasmWordRepr};
-use crate::convert::traits::{WasmAbi, WasmPrimitive};
+use crate::convert::traits::{ScalarIntoWasmAbi, WasmAbi, WasmPrimitive};
 use crate::convert::{
     FromWasmAbi, IntoWasmAbi, LongRefFromWasmAbi, OptionFromWasmAbi, OptionIntoWasmAbi,
     RefFromWasmAbi, ReturnWasmAbi, TryFromJsValue, UpcastFrom,
@@ -855,9 +855,18 @@ pub unsafe fn js_value_vector_from_abi<T: TryFromJsValue>(
     result.into_boxed_slice()
 }
 
-impl<T: Copy + IntoWasmAbi> IntoWasmAbi for &T {
+// `&T` for a scalar `T` is passed to JS by copying the value; the wire is
+// identical to passing `T` by value. See `ScalarIntoWasmAbi` for why this is
+// restricted to a fixed list rather than every `Copy + IntoWasmAbi` type.
+impl<T: ScalarIntoWasmAbi> IntoWasmAbi for &T {
     type Abi = <T as IntoWasmAbi>::Abi;
     fn into_abi(self) -> Self::Abi {
         (*self).into_abi()
     }
 }
+
+// Exactly the descriptors `outgoing_ref` accepts behind a `Ref(..)`.
+macro_rules! scalar_into_wasm_abi {
+    ($($t:ty)*) => ($(impl ScalarIntoWasmAbi for $t {})*)
+}
+scalar_into_wasm_abi!(i8 u8 i16 u16 i32 u32 i64 u64 i128 u128 isize usize f32 f64 bool char);
