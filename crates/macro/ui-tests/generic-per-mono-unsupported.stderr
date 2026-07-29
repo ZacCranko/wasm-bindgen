@@ -33,3 +33,15 @@ error: generic_per_mono does not support a bare generic type parameter as the `v
    |
 34 |     fn variadic_scalar<T>(first: u32, rest: T);
    |                                             ^
+
+error: generic_per_mono does not support an `async` import whose return type mentions a type parameter, because the resolved value of the `Promise` is always a `JsValue` and cannot be monomorphised; return `JsValue` (or a concrete imported JS type) and convert it yourself, or use the type-erasure generic path instead
+  --> ui-tests/generic-per-mono-unsupported.rs:39:44
+   |
+39 |     async fn async_generic_ret<T>(x: T) -> T;
+   |                                            ^
+
+error: generic_per_mono does not support an `async` import whose return type mentions a type parameter, because the resolved value of the `Promise` is always a `JsValue` and cannot be monomorphised; return `JsValue` (or a concrete imported JS type) and convert it yourself, or use the type-erasure generic path instead
+  --> ui-tests/generic-per-mono-unsupported.rs:43:57
+   |
+43 |     async fn async_catch_generic_ret<T>(x: T) -> Result<T, JsValue>;
+   |                                                         ^

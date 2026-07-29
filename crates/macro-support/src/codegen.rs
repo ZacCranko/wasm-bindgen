@@ -2732,6 +2732,23 @@ impl ast::ImportFunction {
                 );
             }
             Some(original_ty) => {
+                // An `async` import always resolves its `Promise` to a
+                // `JsValue`, so there is nothing to monomorphise on: the
+                // returned value's type is fixed by JS, not by `T`. Letting
+                // this through only produces a confusing trait-solver error
+                // pointing at `JsFuture<T>`, so reject it here with the span
+                // of the offending return type instead.
+                if self.function.r#async && generics::uses_generic_params(original_ty, &type_params)
+                {
+                    bail_span!(
+                        original_ty,
+                        "generic_per_mono does not support an `async` import whose return type \
+                         mentions a type parameter, because the resolved value of the `Promise` \
+                         is always a `JsValue` and cannot be monomorphised; return `JsValue` (or \
+                         a concrete imported JS type) and convert it yourself, or use the \
+                         type-erasure generic path instead"
+                    );
+                }
                 let maybe_async_wrapped;
                 let ty = if self.function.r#async {
                     maybe_async_wrapped = parse_quote!(#promise<#original_ty>);

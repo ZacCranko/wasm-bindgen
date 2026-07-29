@@ -32,6 +32,15 @@ extern "C" {
     // may monomorphise to a non-iterable scalar.
     #[wasm_bindgen(generic_per_mono, variadic)]
     fn variadic_scalar<T>(first: u32, rest: T);
+
+    // An `async` import resolves its `Promise` to a `JsValue`, so the return
+    // type cannot mention a type parameter.
+    #[wasm_bindgen(generic_per_mono)]
+    async fn async_generic_ret<T>(x: T) -> T;
+
+    // Same, through the `Ok` type of a `catch` import.
+    #[wasm_bindgen(generic_per_mono, catch)]
+    async fn async_catch_generic_ret<T>(x: T) -> Result<T, JsValue>;
 }
 
 fn main() {}
